@@ -1,0 +1,28 @@
+services:
+  ros:
+    build: .
+    command: tail -f /dev/null
+    ipc: host  # This enables Shared Memory communication
+    volumes: 
+      - ./ros2_ws/src:/root/ros2_ws/src
+    environment:
+      - DISPLAY=novnc:0.0
+    env_file:
+      - ros.env
+    networks:
+      - x11
+  novnc:  
+    image: theasp/novnc:latest
+    env_file:
+      - novnc.env
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "--tries=1", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - x11
+networks:
+  x11:
