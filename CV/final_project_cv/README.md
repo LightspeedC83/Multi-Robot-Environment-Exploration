@@ -15,7 +15,7 @@ camera image
 -> target point in odom
 ```
 
-YOLO is used to identify the target class, such as `sports ball` or `bottle`. FastSAM is then used inside the YOLO bounding box to get a better centroid estimate from the object mask rather than relying only on the rectangular box center.
+YOLO identifies the target class, such as `sports ball` or `bottle`. FastSAM is then applied inside the YOLO bounding box to estimate the centroid from the object mask instead of relying only on the rectangular box center.
 
 The detector publishes:
 
@@ -23,7 +23,7 @@ The detector publishes:
 /target_centroid
 ```
 
-where the message is a `geometry_msgs/PointStamped`:
+as a `geometry_msgs/PointStamped`:
 
 ```text
 point.x = centroid u coordinate in pixels
@@ -46,9 +46,7 @@ and publishes:
 
 ## Depth Assumption
 
-Because we are not using stereo vision or a depth camera, the target depth is estimated from an assumed real-world object diameter.
-
-The main equation is:
+Because we are not using stereo vision or a depth camera, target depth is estimated from an assumed real-world object diameter.
 
 ```text
 Z = f * D / d_px
@@ -78,7 +76,7 @@ Before connecting to the physical robot, we can test the localization math witho
 ros2 launch final_project_cv terminal_logic_pipeline.launch.py
 ```
 
-This publishes synthetic centroid measurements and camera intrinsics, then runs the real localization node. It is useful for verifying the message flow:
+This publishes synthetic centroid measurements and camera intrinsics, then runs the real localization node:
 
 ```text
 synthetic centroid
