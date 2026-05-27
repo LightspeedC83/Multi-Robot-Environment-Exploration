@@ -29,6 +29,9 @@ from tf2_ros import TransformListener, Buffer
 
 from std_srvs.srv import SetBool # service type 
 
+# importing custom services
+from mapper_interfaces.srv import GetUniqueID
+
 
 # Constants.
 # Topic names
@@ -99,6 +102,10 @@ class WorldMapper(Node):
         )
         self.set_parameters([use_sim_time_param])
 
+        ## getting this robot's ID ##
+        self.client = self.create_client(GetUniqueID, 'get_unique_id')
+        self.id = self.request_id("mapper")
+
         ### Setting up publishers/subscribers. ###
 
         # Setting up the publisher to send velocity commands.
@@ -108,12 +115,21 @@ class WorldMapper(Node):
         self._laser_sub = self.create_subscription(LaserScan, DEFAULT_SCAN_TOPIC, self._laser_callback, 1)
 
         # Setting up a publisher to publish the map data the robot creates
-        self._SLAM_map_pub = self.create_publisher(OccupancyGrid, '/SLAM_map', 1)
+        if not self.id is None:
+            self.map_publish_topic_name = f'/SLAM_map_{self.id}'
+        else:
+            self.map_publish_topic_name = '/SLAM_map_NO_ID'    
         
+        self._SLAM_map_pub = self.create_publisher(OccupancyGrid, self.map_publish_topic_name, 1)
+        
+        # setting up a publisher to publish the current position of the robot
+        # TODO: This^^
+
         # setting up on/off service
         self._on_off_service = self.create_service(SetBool, f'{node_name}/{DEFAULT_SERVICE_NAME}', self._turn_on_off_callback)
         self._fsm = fsm.ON
 
+         
         #### parameter definitions ####
 
         # Everything for the SLAM map will be initialized based on the sensor range on the first sensor call
@@ -161,6 +177,27 @@ class WorldMapper(Node):
         # setting up transfer frames
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+
+
+    def request_id(self, requester_name):
+        """this is a a function that gets the id of this robot assigned by the coordinator"""
+        # waiting for service to become live
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for get_unique_id service...')
+        # makign the request
+        request = GetUniqueID.Request()
+        request.requester_name = requester_name
+        
+        future = self.client.call_async(request) # sending the request (get a future in return which will be populated with the response)
+        rclpy.spin_until_future_complete(self, future) # wait until populated
+
+        if future.result() is not None:
+            self.get_logger().info(f"ID assigned as: {future.result().id}")
+            return future.result().id
+        else:
+            self.get_logger().error('ID Service call failed')
+            return None
+
 
     def _wait_for_sim_ready(self, timeout_sec):
         """Wait until simulation clock and cmd_vel subscriber are ready."""

@@ -16,10 +16,18 @@ docker compose up
 
 if docker had completely reset previously, and you need to install dependancies, run the following:
 ```bash
+docker compose exec ros bash
 bash install_stage.sh && source ../install/setup.bash
 apt update
 apt install -y python3-pip
 pip3 install anytree
+```
+
+you may also need to build the interface packages with:
+```bash
+docker compose exec ros bash
+cd /root/ros2_ws
+colcon build
 ```
 
 in another terminal:
@@ -28,6 +36,11 @@ docker compose exec ros bash
 ros2 launch stage_ros2 stage.launch.py world:=/root/ros2_ws/src/mapper/maze enforce_prefixes:=false one_tf_tree:=true
 ```
 
+in another terminal:
+```bash
+docker compose exec ros bash
+python3 mapper/coordinator.py
+```
 
 in another terminal:
 ```bash
