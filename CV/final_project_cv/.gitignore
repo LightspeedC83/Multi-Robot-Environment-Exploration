@@ -1,0 +1,38 @@
+# ROS workspace outputs
+build/
+install/
+log/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+scripts/yolo_fastsam_env/
+
+# Local OS/editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Generated traces and demo outputs
+output/
+output_video.mp4
+result.jpg
+
+# Old one-off experiments are kept locally but are not part of the compact ROS package.
+scripts/
+dataset/
+
+# Large local media/model artifacts.
+# Keep the code in GitHub; store weights/videos separately or download them in setup notes.
+*.pt
+*.mp4
+*.avi
+*.mov
+*.jpeg
+*.jpg
+*.png
+
+weights/
