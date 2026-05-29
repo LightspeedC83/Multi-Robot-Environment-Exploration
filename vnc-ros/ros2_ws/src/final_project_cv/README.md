@@ -1,139 +1,220 @@
 # Computer Vision Target Localization
 
-This folder contains the computer vision and target-localization portion of the project. The goal is to detect a target object in the camera image, estimate where it is relative to the robot, and publish that estimate in the `odom` frame so it can later be used by navigation or path planning.
+This ROS 2 package contains the computer vision portion of the multi-robot exploration project. It runs inside the `vnc-ros` Docker workspace and provides a lightweight Gazebo test world where the robot can detect:
 
-## Pipeline Overview
+- `bottle` objects as semantic heuristic clues
+- `sports ball` as the final goal target
 
-The intended physical-robot pipeline is:
+The pipeline uses YOLO for object detection, optionally refines the selected object with FastSAM, estimates a 3D target point using a monocular size assumption, and publishes that point in the `odom` frame.
 
-```text
-camera image
--> YOLO target detection
--> FastSAM mask refinement
--> centroid + apparent object size
--> monocular depth estimate
--> target point in odom
-```
-
-YOLO identifies the target class, such as `sports ball` or `bottle`. FastSAM is then applied inside the YOLO bounding box to estimate the centroid from the object mask instead of relying only on the rectangular box center.
-
-The detector publishes:
+## Pipeline
 
 ```text
-/target_centroid
+Gazebo camera image
+-> YOLO detection
+-> FastSAM centroid refinement
+-> monocular depth estimate from known object size
+-> transform from camera frame to odom
+-> publish heuristic and goal target points
 ```
 
-as a `geometry_msgs/PointStamped`:
-
-```text
-point.x = centroid u coordinate in pixels
-point.y = centroid v coordinate in pixels
-point.z = observed target diameter in pixels
-```
-
-The localization node combines this with camera intrinsics from:
-
-```text
-/camera/camera_info
-```
-
-and publishes:
-
-```text
-/target_point_odom
-/target_pose_odom
-```
-
-## Depth Assumption
-
-Because we are not using stereo vision or a depth camera, target depth is estimated from an assumed real-world object diameter.
+YOLO gives the object class and bounding box. FastSAM is applied inside the selected box to improve the centroid estimate. If the object is detected, the localizer estimates depth from its apparent pixel diameter:
 
 ```text
 Z = f * D / d_px
 ```
 
-where:
-
-- `Z` is the estimated depth
-- `f` is the camera focal length in pixels
-- `D` is the real target diameter in meters
-- `d_px` is the observed target diameter in pixels
-
-Then the centroid is back-projected into 3D:
+where `D` is the assumed real-world object diameter and `d_px` is the observed diameter in pixels. The point is then back-projected:
 
 ```text
 X = (u - cx) * Z / fx
 Y = (v - cy) * Z / fy
 ```
 
-This works best when the target has a known size and is roughly spherical, which is why a ball is a useful test object.
+The final point is transformed into `odom`, so planning code can subscribe to a stable map-frame estimate.
 
-## Terminal Logic Test
+## Main Topics
 
-Before connecting to the physical robot, we can test the localization math without loading YOLO, FastSAM, or PyTorch:
-
-```bash
-ros2 launch final_project_cv terminal_logic_pipeline.launch.py
-```
-
-This publishes synthetic centroid measurements and camera intrinsics, then runs the real localization node:
+Inputs:
 
 ```text
-synthetic centroid
--> camera intrinsics
--> target_localizer
--> odom target point
+/camera/image_raw
+/camera/camera_info
+/tf
+/odom
+/cmd_vel
 ```
 
-The test also records a CSV and plot:
+Detection outputs:
 
 ```text
-output/target_trace.csv
-output/target_trace.png
+/heuristic_centroid
+/goal_centroid
+/heuristic_debug_image
+/goal_debug_image
 ```
 
-These plots show how changing image centroids and apparent object size produce different estimated target points.
+Odom-frame target outputs:
 
-## Physical Robot Test
+```text
+/heuristic_point_odom
+/goal_point_odom
+/heuristic_pose_odom
+/goal_pose_odom
+```
 
-Once the robot camera is available, the full pipeline can be launched with:
+`/heuristic_point_odom` is the estimated bottle location. `/goal_point_odom` is the estimated sports ball location.
+
+## Run The Demo
+
+Start the Docker environment from the host machine:
 
 ```bash
-ros2 launch final_project_cv target_tracking_pipeline.launch.py \
-  target:="sports ball" \
-  object_diameter_m:=0.22 \
-  image_topic:=/camera/image_raw \
-  camera_info_topic:=/camera/camera_info \
-  target_frame:=odom \
-  use_fastsam:=true
+cd ~/Dartmouth/Robotics/vnc-ros
+docker compose up -d
 ```
 
-The exact camera topics and camera frame may need to be adjusted depending on the robot.
-
-Useful checks:
+Open a Docker terminal:
 
 ```bash
-ros2 topic list | grep camera
-ros2 topic echo /camera/camera_info --once
-ros2 topic echo /target_centroid
-ros2 topic echo /target_point_odom
+docker compose exec ros bash
 ```
+
+Build the package:
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select final_project_cv
+source install/setup.bash
+```
+
+### Terminal 1: Gazebo
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch final_project_cv lightweight_targets_gazebo.launch.py
+```
+
+This opens the lightweight world with a robot, camera, odometry, sparse obstacles, heuristic bottles, and an orange sports ball goal. The world also includes a top-down default view and a blue camera field-of-view visualization.
+
+### Terminal 2: CV Pipeline
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py process_every_n:=2 use_fastsam:=true
+```
+
+This starts two detector/localizer pairs:
+
+```text
+bottle       -> heuristic detector -> /heuristic_point_odom
+sports ball  -> goal detector      -> /goal_point_odom
+```
+
+The terminal logs print centroid, FastSAM usage, estimated range, and odom coordinates when a target is visible.
+
+### Terminal 3: Debug Images
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+Useful image topics:
+
+```text
+/camera/image_raw
+/heuristic_debug_image
+/goal_debug_image
+```
+
+The debug image shows the selected box, segmentation mask when available, and the centroid used for localization.
+
+### Terminal 4: Teleop
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/cmd_vel
+```
+
+Common controls:
+
+```text
+i   forward
+,   backward
+j   turn left
+l   turn right
+k   stop
+q   increase speed
+z   decrease speed
+```
+
+Keep the teleop terminal focused while driving.
+
+## Inspect Outputs
+
+Echo the odom-frame detections:
+
+```bash
+ros2 topic echo /heuristic_point_odom
+ros2 topic echo /goal_point_odom
+```
+
+List the relevant topics:
+
+```bash
+ros2 topic list | grep -E "camera|heuristic|goal|odom|cmd_vel"
+```
+
+Expected log examples:
+
+```text
+heuristics detected: centroid=(...), diameter_px=..., source=fastsam
+heuristics detected: odom=(x=..., y=..., z=...), range=...
+
+goal found sphere detected: centroid=(...), diameter_px=..., source=fastsam
+goal found sphere detected: odom=(x=..., y=..., z=...), range=...
+```
+
+## Clean Restart
+
+If Gazebo, TF, or FastDDS gets noisy after several restarts:
+
+```bash
+pkill -f gazebo || true
+pkill -f gzserver || true
+pkill -f gzclient || true
+pkill -f rqt_image_view || true
+rm -f /dev/shm/fastrtps_* /dev/shm/fastdds_*
+rm -f ~/.gazebo/gui.ini
+```
+
+Then rebuild and launch again.
 
 ## Semantic Search Heuristic
 
-For path planning, the team is also considering a semantic search heuristic. The idea is to maintain a belief grid over possible target locations.
+The planning idea is to maintain a belief grid over possible goal locations:
 
 - All cells start with a uniform belief.
-- If the robot observes an area and does not see the target or a useful clue, the belief of those cells is reduced.
-- If the robot sees a heuristic clue, cells around that clue are boosted.
-- If the target is found, search ends and the robot switches to direct target localization.
+- If the robot observes an area and sees no goal or heuristic, those cells are down-weighted.
+- If the robot sees a heuristic bottle, nearby cells are up-weighted.
+- If the sports ball is found, search ends and the robot can switch to goal-directed behavior.
 
-In simple form:
+In compact form:
 
 ```text
 no clue observed:  B(cell) <- B(cell) / alpha
 clue observed:     B(cell) <- beta * B(cell)
-target observed:   switch to target localization
+target observed:   finish search
 ```
 
-This lets the planner prefer regions that are more likely to contain the target while still avoiding areas that have already been checked.
+The CV package provides the semantic observations and odom-frame coordinates needed for that belief update.
