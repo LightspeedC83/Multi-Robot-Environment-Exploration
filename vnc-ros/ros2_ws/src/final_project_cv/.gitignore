@@ -15,6 +15,7 @@ scripts/yolo_fastsam_env/
 .DS_Store
 .vscode/
 .idea/
+*.code-workspace
 
 # Generated traces and demo outputs
 output/

@@ -111,6 +111,50 @@ def parameter_as_bool(value):
     return bool(value)
 
 
+def parse_class_list(value):
+    if isinstance(value, (list, tuple)):
+        return {str(item).strip() for item in value if str(item).strip()}
+
+    return {
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip()
+    }
+
+
+def project_detection_message(class_name):
+    if class_name == "sports ball":
+        return "goal found sphere detected"
+
+    if class_name == "bottle":
+        return "heuristics detected"
+
+    return class_name
+
+
+def compact_detection_label(class_name):
+    if class_name == "sports ball":
+        return "goal sphere"
+
+    if class_name == "bottle":
+        return "heuristic"
+
+    return class_name
+
+
+def detection_bbox_from_mask(mask):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+
+    return [
+        float(np.min(xs)),
+        float(np.min(ys)),
+        float(np.max(xs) + 1),
+        float(np.max(ys) + 1),
+    ]
+
+
 def resolve_model_path(model_name):
     path = Path(model_name)
     if path.exists():
@@ -159,6 +203,10 @@ class VisionTargetDetector(Node):
         self.declare_parameter("fastsam_weights", "FastSAM-s.pt")
         self.declare_parameter("use_fastsam", False)
         self.declare_parameter("publish_debug_image", True)
+        self.declare_parameter("draw_all_detections", True)
+        self.declare_parameter("display_classes", "bottle,sports ball")
+        self.declare_parameter("use_sim_bottle_color_fallback", True)
+        self.declare_parameter("sim_bottle_min_area", 25.0)
         self.declare_parameter("yolo_conf", 0.25)
         self.declare_parameter("fastsam_conf", 0.4)
         self.declare_parameter("fastsam_iou", 0.9)
@@ -179,6 +227,12 @@ class VisionTargetDetector(Node):
         self.fastsam_weights = resolve_model_path(self.get_parameter("fastsam_weights").value)
         self.use_fastsam = parameter_as_bool(self.get_parameter("use_fastsam").value)
         self.publish_debug_image = parameter_as_bool(self.get_parameter("publish_debug_image").value)
+        self.draw_all_detections = parameter_as_bool(self.get_parameter("draw_all_detections").value)
+        self.display_classes = parse_class_list(self.get_parameter("display_classes").value)
+        self.use_sim_bottle_color_fallback = parameter_as_bool(
+            self.get_parameter("use_sim_bottle_color_fallback").value
+        )
+        self.sim_bottle_min_area = float(self.get_parameter("sim_bottle_min_area").value)
         self.yolo_conf = float(self.get_parameter("yolo_conf").value)
         self.fastsam_conf = float(self.get_parameter("fastsam_conf").value)
         self.fastsam_iou = float(self.get_parameter("fastsam_iou").value)
@@ -216,7 +270,7 @@ class VisionTargetDetector(Node):
         self.centroid_publisher = self.create_publisher(PointStamped, self.centroid_topic, 10)
         self.debug_image_publisher = self.create_publisher(Image, self.debug_image_topic, 10)
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f"Vision detector started: target='{self.target}', "
             f"use_fastsam={self.use_fastsam}, image_topic='{self.image_topic}', "
             f"process_width={self.process_width}, imgsz={self.imgsz}, "
@@ -259,34 +313,94 @@ class VisionTargetDetector(Node):
             imgsz=self.imgsz,
             verbose=False,
         )
-        detections = self.get_detections_by_class(yolo_results[0])
+        all_detections = self.get_all_detections(yolo_results[0])
+        if self.use_sim_bottle_color_fallback:
+            all_detections.extend(self.detect_sim_bottles(processed_frame))
+
+        visible_detections = [
+            detection for detection in all_detections
+            if detection["class_name"] in self.display_classes
+        ]
+        detections = [
+            detection for detection in visible_detections
+            if detection["class_name"] == self.target
+        ]
         selected = self.select_detection(detections, processed_frame.shape)
 
         if selected is None:
-            self.publish_debug_frame(msg, processed_frame)
+            if visible_detections:
+                status_text = self.project_detection_summary(visible_detections)
+            else:
+                status_text = "no bottle/sports ball"
+            self.publish_debug_frame(
+                msg,
+                processed_frame,
+                all_detections=visible_detections,
+                status_text=status_text,
+            )
             return
 
         # YOLO answers "which target and where roughly?" FastSAM, when enabled,
         # refines that into a mask-based centroid for localization.
-        bbox, confidence, class_id = selected
+        bbox = selected["bbox"]
+        confidence = selected["confidence"]
         bbox = smooth_values(self.tracked_bbox, bbox, self.smooth_alpha)
         self.tracked_bbox = bbox
 
-        measurement = self.compute_measurement(processed_frame, bbox)
+        selected_for_measurement = dict(selected)
+        selected_for_measurement["bbox"] = bbox
+        measurement = self.compute_measurement(processed_frame, selected_for_measurement)
         if measurement is None:
-            self.publish_debug_frame(msg, processed_frame)
+            self.publish_debug_frame(
+                msg,
+                processed_frame,
+                all_detections=visible_detections,
+                status_text=f"no measurement for target='{self.target}'",
+            )
             return
 
-        centroid, pixel_diameter, mask = measurement
+        centroid, pixel_diameter, mask, measurement_source = measurement
         centroid = tuple(smooth_values(self.tracked_centroid, centroid, self.smooth_alpha))
         self.tracked_centroid = centroid
         pixel_diameter = smooth_value(self.tracked_diameter, pixel_diameter, self.smooth_alpha)
         self.tracked_diameter = pixel_diameter
 
-        self.publish_centroid(msg, centroid, pixel_diameter, scale)
-        self.publish_debug_frame(msg, processed_frame, bbox, centroid, confidence, mask)
+        self.publish_centroid(
+            msg,
+            centroid,
+            pixel_diameter,
+            scale,
+            selected["class_name"],
+            measurement_source,
+        )
+        self.publish_debug_frame(
+            msg,
+            processed_frame,
+            bbox,
+            centroid,
+            confidence,
+            mask,
+            target_class=selected["class_name"],
+            all_detections=visible_detections,
+            measurement_source=measurement_source,
+        )
 
-    def get_detections_by_class(self, result):
+    def project_detection_summary(self, detections):
+        messages = []
+        for class_name in ("sports ball", "bottle"):
+            class_detections = [
+                detection for detection in detections
+                if detection["class_name"] == class_name
+            ]
+            if not class_detections:
+                continue
+
+            best = max(class_detections, key=lambda item: item["confidence"])
+            messages.append(f"{project_detection_message(class_name)} ({best['confidence']:.2f})")
+
+        return " | ".join(messages)
+
+    def get_all_detections(self, result):
         if result.boxes is None or len(result.boxes) == 0:
             return []
 
@@ -298,12 +412,59 @@ class VisionTargetDetector(Node):
             class_name = names[class_id]
             confidence = float(box.conf[0])
 
-            if class_name != self.target:
-                continue
-
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             bbox = [float(x1), float(y1), float(x2), float(y2)]
-            detections.append((bbox, confidence, class_id))
+            detections.append({
+                "bbox": bbox,
+                "confidence": confidence,
+                "class_id": class_id,
+                "class_name": class_name,
+                "source": "yolo",
+                "mask": None,
+            })
+
+        return detections
+
+    def detect_sim_bottles(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # The lightweight Gazebo bottles are deliberately cyan/blue. This
+        # fallback is only for the synthetic world where pretrained YOLO does
+        # not see simple cylinder models as real bottles.
+        lower_blue = np.array([82, 45, 35], dtype=np.uint8)
+        upper_blue = np.array([112, 255, 235], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detections = []
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.sim_bottle_min_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if h < 10 or w < 3 or h < 1.35 * w:
+                continue
+
+            component_mask = np.zeros(mask.shape, dtype=np.uint8)
+            cv2.drawContours(component_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            bbox = detection_bbox_from_mask(component_mask)
+            if bbox is None:
+                continue
+
+            detections.append({
+                "bbox": bbox,
+                "confidence": 0.95,
+                "class_id": -1,
+                "class_name": "bottle",
+                "source": "sim_color",
+                "mask": component_mask.astype(np.float32) / 255.0,
+            })
 
         return detections
 
@@ -312,60 +473,80 @@ class VisionTargetDetector(Node):
             return None
 
         if self.tracked_bbox is not None:
-            return max(detections, key=lambda item: (bbox_iou(item[0], self.tracked_bbox), item[1]))
+            return max(
+                detections,
+                key=lambda item: (bbox_iou(item["bbox"], self.tracked_bbox), item["confidence"]),
+            )
 
         height, width = frame_shape[:2]
         frame_center = (width / 2.0, height / 2.0)
 
         if self.selection_strategy == "confidence":
-            return max(detections, key=lambda item: item[1])
+            return max(detections, key=lambda item: item["confidence"])
 
         if self.selection_strategy == "largest":
-            return max(detections, key=lambda item: (bbox_area(item[0]), item[1]))
+            return max(detections, key=lambda item: (bbox_area(item["bbox"]), item["confidence"]))
 
         if self.selection_strategy == "bottom":
-            return max(detections, key=lambda item: (item[0][3], bbox_area(item[0]), item[1]))
+            return max(
+                detections,
+                key=lambda item: (item["bbox"][3], bbox_area(item["bbox"]), item["confidence"]),
+            )
 
         if self.selection_strategy == "center":
             def center_score(item):
-                cx, cy = bbox_center(item[0])
+                cx, cy = bbox_center(item["bbox"])
                 distance = math.hypot(cx - frame_center[0], cy - frame_center[1])
-                return (-distance, item[1])
+                return (-distance, item["confidence"])
 
             return max(detections, key=center_score)
 
         raise ValueError(f"Unknown selection_strategy: {self.selection_strategy}")
 
-    def compute_measurement(self, frame, bbox):
-        fallback = (bbox_center(bbox), bbox_diameter(bbox), None)
+    def compute_measurement(self, frame, detection):
+        bbox = detection["bbox"]
+        detection_mask = detection.get("mask")
+        detection_source = detection.get("source")
 
-        if not self.use_fastsam:
-            return fallback
+        fallback = (bbox_center(bbox), bbox_diameter(bbox), None, "bbox")
 
-        sam_results = self.segmenter(
-            frame,
-            bboxes=[bbox],
-            imgsz=self.imgsz,
-            retina_masks=True,
-            conf=self.fastsam_conf,
-            iou=self.fastsam_iou,
-            verbose=False,
-        )
+        if self.use_fastsam:
+            sam_results = self.segmenter(
+                frame,
+                bboxes=[bbox],
+                imgsz=self.imgsz,
+                retina_masks=True,
+                conf=self.fastsam_conf,
+                iou=self.fastsam_iou,
+                verbose=False,
+            )
 
-        if not sam_results or sam_results[0].masks is None:
-            return fallback
+            if sam_results and sam_results[0].masks is not None:
+                mask = sam_results[0].masks.data[0].cpu().numpy()
+                mask = resize_mask_to_frame(mask, frame.shape)
+                measurement = mask_measurement(mask)
 
-        mask = sam_results[0].masks.data[0].cpu().numpy()
-        mask = resize_mask_to_frame(mask, frame.shape)
-        measurement = mask_measurement(mask)
+                if measurement is not None:
+                    centroid, pixel_diameter = measurement
+                    return centroid, pixel_diameter, mask, "fastsam"
 
-        if measurement is None:
-            return fallback
+        if detection_mask is not None:
+            measurement = mask_measurement(detection_mask)
+            if measurement is not None:
+                centroid, pixel_diameter = measurement
+                return centroid, pixel_diameter, detection_mask, detection_source
 
-        centroid, pixel_diameter = measurement
-        return centroid, pixel_diameter, mask
+        return fallback
 
-    def publish_centroid(self, image_msg, centroid, pixel_diameter, scale):
+    def publish_centroid(
+        self,
+        image_msg,
+        centroid,
+        pixel_diameter,
+        scale,
+        target_class,
+        measurement_source,
+    ):
         u, v = centroid
 
         if scale != 0.0:
@@ -381,22 +562,56 @@ class VisionTargetDetector(Node):
         self.centroid_publisher.publish(msg)
 
         self.get_logger().info(
-            f"target={self.target}, u={u:.1f}, v={v:.1f}, "
-            f"diameter_px={pixel_diameter:.1f}",
+            f"{project_detection_message(target_class)}: "
+            f"centroid=({u:.1f},{v:.1f}) px, "
+            f"diameter_px={pixel_diameter:.1f}, source={measurement_source}",
             throttle_duration_sec=0.5,
         )
 
-    def publish_debug_frame(self, image_msg, frame, bbox=None, centroid=None, confidence=None, mask=None):
+    def publish_debug_frame(
+        self,
+        image_msg,
+        frame,
+        bbox=None,
+        centroid=None,
+        confidence=None,
+        mask=None,
+        target_class=None,
+        all_detections=None,
+        status_text=None,
+        measurement_source=None,
+    ):
         if not self.publish_debug_image:
             return
 
         debug = frame.copy()
 
+        if self.draw_all_detections:
+            for detection in all_detections or []:
+                x1, y1, x2, y2 = map(int, detection["bbox"])
+                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 210, 255), 1)
+                cv2.putText(
+                    debug,
+                    f"{compact_detection_label(detection['class_name'])} {detection['confidence']:.2f}",
+                    (x1, max(15, y1 - 6)),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.32,
+                    (0, 0, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
         if mask is not None:
             mask = resize_mask_to_frame(mask, debug.shape) > 0.5
             overlay = debug.copy()
             overlay[mask] = (0, 180, 80)
-            debug = cv2.addWeighted(overlay, 0.35, debug, 0.65, 0.0)
+            debug = cv2.addWeighted(overlay, 0.45, debug, 0.55, 0.0)
+            contours, _ = cv2.findContours(
+                mask.astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            cv2.drawContours(debug, contours, -1, (0, 120, 0), 1)
 
         if bbox is not None:
             x1, y1, x2, y2 = map(int, bbox)
@@ -404,17 +619,42 @@ class VisionTargetDetector(Node):
 
         if centroid is not None:
             u, v = centroid
-            cv2.circle(debug, (int(u), int(v)), 5, (0, 0, 255), -1)
+            center = (int(u), int(v))
+            cv2.circle(debug, center, 5, (0, 0, 0), 1, cv2.LINE_AA)
+            cv2.circle(debug, center, 3, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.drawMarker(
+                debug,
+                center,
+                (0, 0, 0),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=12,
+                thickness=1,
+                line_type=cv2.LINE_AA,
+            )
 
         if confidence is not None:
+            source = f" | {measurement_source}" if measurement_source else ""
             cv2.putText(
                 debug,
-                f"{self.target} conf={confidence:.2f}",
-                (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0, 0, 255),
-                2,
+                f"{project_detection_message(target_class or self.target)} {confidence:.2f}{source}",
+                (8, 18),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.4,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        if status_text is not None:
+            cv2.putText(
+                debug,
+                status_text,
+                (8, 18),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.4,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
             )
 
         debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")

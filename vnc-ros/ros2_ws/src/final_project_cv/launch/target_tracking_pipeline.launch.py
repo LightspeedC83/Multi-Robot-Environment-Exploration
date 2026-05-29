@@ -21,6 +21,7 @@ def generate_launch_description():
     process_every_n = LaunchConfiguration("process_every_n")
     imgsz = LaunchConfiguration("imgsz")
     smooth_alpha = LaunchConfiguration("smooth_alpha")
+    use_sim_bottle_color_fallback = LaunchConfiguration("use_sim_bottle_color_fallback")
 
     return LaunchDescription([
         DeclareLaunchArgument("target", default_value="bottle"),
@@ -38,6 +39,7 @@ def generate_launch_description():
         DeclareLaunchArgument("process_every_n", default_value="1"),
         DeclareLaunchArgument("imgsz", default_value="640"),
         DeclareLaunchArgument("smooth_alpha", default_value="0.65"),
+        DeclareLaunchArgument("use_sim_bottle_color_fallback", default_value="true"),
         Node(
             package="final_project_cv",
             executable="vision_target_detector",
@@ -58,6 +60,11 @@ def generate_launch_description():
                 "selection_strategy": "largest",
                 "smooth_alpha": ParameterValue(smooth_alpha, value_type=float),
                 "disable_nnpack": True,
+                "fuse_yolo_model": False,
+                "use_sim_bottle_color_fallback": ParameterValue(
+                    use_sim_bottle_color_fallback,
+                    value_type=bool,
+                ),
             }],
         ),
         Node(
@@ -68,6 +75,7 @@ def generate_launch_description():
             parameters=[{
                 "centroid_topic": "/target_centroid",
                 "camera_info_topic": camera_info_topic,
+                "target": target,
                 "target_frame": target_frame,
                 "camera_frame": camera_frame,
                 "object_diameter_m": ParameterValue(object_diameter_m, value_type=float),

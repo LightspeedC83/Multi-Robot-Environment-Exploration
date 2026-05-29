@@ -9,6 +9,16 @@ from tf2_ros import Buffer, ConnectivityException, ExtrapolationException, Looku
 from tf2_ros import TransformListener
 
 
+def project_detection_message(class_name):
+    if class_name == "sports ball":
+        return "goal found sphere detected"
+
+    if class_name == "bottle":
+        return "heuristics detected"
+
+    return class_name
+
+
 def rotate_vector_by_quaternion(vector, quaternion):
     # tf2_geometry_msgs is not always installed in the course Docker image, so we
     # keep the point transform explicit instead of adding another dependency.
@@ -50,6 +60,9 @@ class TargetLocalizer(Node):
 
         self.declare_parameter("centroid_topic", "/target_centroid")
         self.declare_parameter("camera_info_topic", "/camera/camera_info")
+        self.declare_parameter("point_topic", "/target_point_odom")
+        self.declare_parameter("pose_topic", "/target_pose_odom")
+        self.declare_parameter("target", "bottle")
         self.declare_parameter("target_frame", "odom")
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("object_diameter_m", 0.07)
@@ -60,6 +73,10 @@ class TargetLocalizer(Node):
 
         self.centroid_topic = self.get_parameter("centroid_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
+        self.point_topic = self.get_parameter("point_topic").value
+        self.pose_topic = self.get_parameter("pose_topic").value
+        self.target = self.get_parameter("target").value
+        self.event_label = project_detection_message(self.target)
         self.target_frame = self.get_parameter("target_frame").value
         self.camera_frame_parameter = self.get_parameter("camera_frame").value
         self.object_diameter_m = float(self.get_parameter("object_diameter_m").value)
@@ -86,12 +103,11 @@ class TargetLocalizer(Node):
             10,
         )
 
-        self.point_publisher = self.create_publisher(PointStamped, "/target_point_odom", 10)
-        self.pose_publisher = self.create_publisher(PoseStamped, "/target_pose_odom", 10)
+        self.point_publisher = self.create_publisher(PointStamped, self.point_topic, 10)
+        self.pose_publisher = self.create_publisher(PoseStamped, self.pose_topic, 10)
 
-        self.get_logger().info(
-            "Target localizer started. Expected centroid message: "
-            "PointStamped point.x=u_px, point.y=v_px, point.z=observed_diameter_px."
+        self.get_logger().debug(
+            "Target localizer ready for PointStamped centroid messages."
         )
 
     def camera_info_callback(self, msg):
@@ -144,11 +160,13 @@ class TargetLocalizer(Node):
         self.pose_publisher.publish(pose_odom)
 
         self.get_logger().info(
-            f"target in {self.target_frame}: "
+            f"{self.event_label}: "
+            f"{self.target_frame}=("
             f"x={point_odom.point.x:.2f}, "
             f"y={point_odom.point.y:.2f}, "
-            f"z={point_odom.point.z:.2f}, "
-            f"range={depth:.2f} m",
+            f"z={point_odom.point.z:.2f}), "
+            f"range={depth:.2f} m, "
+            f"image_centroid=({u:.1f},{v:.1f}) px",
             throttle_duration_sec=self.log_throttle_sec,
         )
 
