@@ -1,45 +1,100 @@
 # Computer Vision Target Localization
 
-This ROS 2 package contains the computer vision part of the multi-robot exploration project. It runs inside the `vnc-ros` Docker workspace and provides a lightweight Gazebo world with two small robots, sparse obstacles, heuristic bottles, and an orange sports ball goal.
-
-Each robot has:
+This package is the CV interface for the multi-robot exploration project. It runs in the `vnc-ros` Docker workspace and provides a lightweight Gazebo world with two robots, each with:
 
 - RGB camera
 - 2D LiDAR
-- differential drive teleop through `/robotX/cmd_vel`
-- odometry through `/robotX/odom`
-- namespaced camera, scan, debug, and target topics
+- odometry
+- differential-drive `cmd_vel`
+- YOLO/FastSAM target detection
+- odom-frame target localization
 
-The CV pipeline uses YOLO for object detection, optionally refines the selected object with FastSAM, estimates a 3D target point using a monocular size assumption, and logs the LiDAR beam that corresponds to the target bearing.
+The detector recognizes:
 
-## Pipeline
+- `bottle` as a heuristic clue
+- `sports ball` as the goal target
+
+The output is intended for the planning and map-merging side of the project: each robot publishes semantic target observations in its own odom frame, plus a LiDAR sanity check at the same target bearing.
+
+## CV Pipeline
 
 ```text
-Gazebo camera image
--> YOLO detection
--> FastSAM centroid refinement
--> monocular depth estimate from known object size
--> transform camera point into robot odom
--> compare with LiDAR beam at the same bearing
--> publish heuristic and goal target points
+camera image
+-> YOLO bounding box
+-> FastSAM mask refinement
+-> centroid and observed pixel diameter
+-> monocular depth estimate
+-> target point in robot odom frame
+-> matching LiDAR beam check
 ```
 
-YOLO gives the object class and bounding box. FastSAM is applied inside the selected box to improve the centroid estimate. The localizer estimates depth from the apparent pixel diameter:
+Depth is estimated from the apparent target size:
 
 ```text
 Z = f * D / d_px
 ```
 
-where `D` is the assumed real-world object diameter and `d_px` is the observed diameter in pixels. The point is then back-projected:
+where `D` is the assumed real object diameter and `d_px` is the observed diameter in pixels. The centroid is back-projected with:
 
 ```text
 X = (u - cx) * Z / fx
 Y = (v - cy) * Z / fy
 ```
 
-The resulting point is transformed into the robot odom frame. The localizer also transforms that target point into the LiDAR frame, finds the nearest scan beam by bearing, and prints the matching LiDAR range in the terminal log.
+The localizer then transforms the point into the robot's odom frame and logs the LiDAR range near the same bearing.
 
-## Main Topics
+## Planning Interface
+
+Subscribe to these topics for semantic search and goal handling:
+
+```text
+/robot1/heuristic_point_odom
+/robot1/goal_point_odom
+/robot2/heuristic_point_odom
+/robot2/goal_point_odom
+```
+
+Each message is a `geometry_msgs/PointStamped`.
+
+```text
+header.frame_id = robot1/odom or robot2/odom
+point.x         = estimated target x in that odom frame
+point.y         = estimated target y in that odom frame
+point.z         = estimated target height/depth component from projection
+```
+
+Use these topics as semantic observations:
+
+```text
+bottle detected      -> boost belief near that odom point
+sports ball detected -> goal found / terminate search or switch to approach behavior
+no detection         -> planning may down-weight currently visible cells
+```
+
+Important frame note: `/robot1/heuristic_point_odom` is in `robot1/odom`, and `/robot2/heuristic_point_odom` is in `robot2/odom`. The map-merging layer must align those odom/map frames before combining target observations into one global belief grid.
+
+## Map-Merging Interface
+
+The CV package does not merge occupancy maps. It provides semantic target observations that can be fused after the mapping layer aligns robot frames.
+
+Expected integration pattern:
+
+```text
+/robot1/scan -> robot1 mapper -> /robot1/SLAM_map
+/robot2/scan -> robot2 mapper -> /robot2/SLAM_map
+
+/robot1/SLAM_map + /robot2/SLAM_map
+-> map merger estimates robot2 map transform into robot1/global frame
+-> /merged_map
+
+/robot1/heuristic_point_odom + /robot2/heuristic_point_odom
+-> transform both semantic observations into merged-map frame
+-> update heuristic belief grid
+```
+
+If the map merger chooses `robot1/odom` as the global reference, then robot 1 target points can be used directly and robot 2 target points must be transformed through the estimated map alignment.
+
+## Topics
 
 Robot 1:
 
@@ -69,24 +124,17 @@ Robot 2:
 /robot2/goal_point_odom
 ```
 
-`heuristic_point_odom` is the estimated bottle location. `goal_point_odom` is the estimated sports ball location.
-
-## Run The Demo
+## Run The Two-Robot Demo
 
 Start Docker from the host machine:
 
 ```bash
 cd ~/Dartmouth/Robotics/vnc-ros
 docker compose up -d
-```
-
-Open a Docker terminal:
-
-```bash
 docker compose exec ros bash
 ```
 
-Build the package:
+Build:
 
 ```bash
 cd /root/ros2_ws
@@ -95,7 +143,7 @@ colcon build --symlink-install --packages-select final_project_cv
 source install/setup.bash
 ```
 
-### Terminal 1: Gazebo
+Terminal 1, Gazebo:
 
 ```bash
 cd /root/ros2_ws
@@ -104,69 +152,19 @@ source install/setup.bash
 ros2 launch final_project_cv lightweight_targets_gazebo.launch.py
 ```
 
-This starts the two-robot world. Gazebo opens from above and shows each robot's blue camera-view footprint.
-
-### Terminal 2: Robot 1 CV Pipeline
+Terminal 2, robot 1 CV:
 
 ```bash
 cd /root/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py process_every_n:=2 use_fastsam:=true
+ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py \
+  robot_namespace:=robot1 \
+  process_every_n:=2 \
+  use_fastsam:=true
 ```
 
-This defaults to `robot1`. It starts the bottle detector/localizer and the sports-ball detector/localizer:
-
-```text
-bottle       -> /robot1/heuristic_point_odom
-sports ball  -> /robot1/goal_point_odom
-```
-
-The terminal logs include the odom point, the monocular vision range, and the LiDAR range near the corresponding target bearing.
-
-### Terminal 3: Robot 1 Debug Images
-
-```bash
-cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 run rqt_image_view rqt_image_view
-```
-
-Useful image topics:
-
-```text
-/robot1/camera/image_raw
-/robot1/heuristic_debug_image
-/robot1/goal_debug_image
-```
-
-### Terminal 4: Robot 1 Teleop
-
-```bash
-cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot1/cmd_vel
-```
-
-Controls:
-
-```text
-i   forward
-,   backward
-j   turn left
-l   turn right
-k   stop
-q   increase speed
-z   decrease speed
-```
-
-Keep the teleop terminal focused while driving.
-
-## Running Robot 2 Instead
-
-Gazebo already starts both robots. To run the same CV pipeline on robot 2, use:
+Terminal 3, robot 2 CV:
 
 ```bash
 cd /root/ros2_ws
@@ -178,44 +176,80 @@ ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py \
   use_fastsam:=true
 ```
 
-Robot 2 teleop:
+Running both CV pipelines is heavier because it starts two YOLO/FastSAM stacks. If the laptop slows down, set `process_every_n:=3` or run CV for one robot at a time.
+
+Terminal 4, image viewer:
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+Useful debug images:
+
+```text
+/robot1/heuristic_debug_image
+/robot1/goal_debug_image
+/robot2/heuristic_debug_image
+/robot2/goal_debug_image
+```
+
+Terminal 5, robot 1 teleop:
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot1/cmd_vel
+```
+
+Terminal 6, robot 2 teleop:
 
 ```bash
 ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot2/cmd_vel
 ```
 
-Running CV on both robots at once is possible, but it is heavier because it launches two YOLO/FastSAM pipelines. For smoother demos, start with one robot.
+Teleop controls:
+
+```text
+i   forward
+,   backward
+j   turn left
+l   turn right
+k   stop
+q   increase speed
+z   decrease speed
+```
 
 ## Inspect Outputs
 
-Echo target points:
+Target points:
 
 ```bash
 ros2 topic echo /robot1/heuristic_point_odom
 ros2 topic echo /robot1/goal_point_odom
+ros2 topic echo /robot2/heuristic_point_odom
+ros2 topic echo /robot2/goal_point_odom
 ```
 
-Echo LiDAR:
+LiDAR:
 
 ```bash
 ros2 topic echo /robot1/scan
+ros2 topic echo /robot2/scan
 ```
 
-List useful topics:
+Topic list:
 
 ```bash
 ros2 topic list | grep -E "robot1|robot2|camera|scan|heuristic|goal|odom|cmd_vel"
 ```
 
-Expected terminal logs:
+Expected CV/localizer logs:
 
 ```text
 heuristics detected: robot1/odom=(x=..., y=..., z=...), range=..., image_centroid=(...), lidar=... m near ... deg, vision_planar_range=... m
 
-goal found sphere detected: robot1/odom=(x=..., y=..., z=...), range=..., image_centroid=(...), lidar=... m near ... deg, vision_planar_range=... m
+goal found sphere detected: robot2/odom=(x=..., y=..., z=...), range=..., image_centroid=(...), lidar=... m near ... deg, vision_planar_range=... m
 ```
 
-The LiDAR value is not another object detector. It is the LaserScan range at the bearing where the CV-estimated target point should be. It is useful as a sanity check against the monocular depth estimate.
+The LiDAR value is not another classifier. It is the LaserScan range at the bearing where the CV-estimated target point should be, useful for checking whether the monocular depth estimate is plausible.
 
 ## Clean Restart
 
@@ -230,23 +264,4 @@ rm -f /dev/shm/fastrtps_* /dev/shm/fastdds_*
 rm -f ~/.gazebo/gui.ini
 ```
 
-Then rebuild and launch again.
-
-## Semantic Search Heuristic
-
-The planning idea is to maintain a belief grid over possible goal locations:
-
-- All cells start with a uniform belief.
-- If the robot observes an area and sees no goal or heuristic, those cells are down-weighted.
-- If the robot sees a heuristic bottle, nearby cells are up-weighted.
-- If the sports ball is found, search ends and the robot can switch to goal-directed behavior.
-
-In compact form:
-
-```text
-no clue observed:  B(cell) <- B(cell) / alpha
-clue observed:     B(cell) <- beta * B(cell)
-target observed:   finish search
-```
-
-The CV package provides the semantic observations, odom-frame target coordinates, and a matching LiDAR range check for each visible target.
+Then rebuild and relaunch.
