@@ -4,7 +4,7 @@ import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import CameraInfo, LaserScan
 from tf2_ros import Buffer, ConnectivityException, ExtrapolationException, LookupException
 from tf2_ros import TransformListener
 
@@ -60,32 +60,39 @@ class TargetLocalizer(Node):
 
         self.declare_parameter("centroid_topic", "/target_centroid")
         self.declare_parameter("camera_info_topic", "/camera/camera_info")
+        self.declare_parameter("scan_topic", "")
         self.declare_parameter("point_topic", "/target_point_odom")
         self.declare_parameter("pose_topic", "/target_pose_odom")
         self.declare_parameter("target", "bottle")
         self.declare_parameter("target_frame", "odom")
         self.declare_parameter("camera_frame", "")
+        self.declare_parameter("lidar_frame", "")
         self.declare_parameter("object_diameter_m", 0.07)
         self.declare_parameter("assumed_depth_m", 1.0)
         self.declare_parameter("min_pixel_diameter", 3.0)
         self.declare_parameter("max_range_m", 10.0)
+        self.declare_parameter("lidar_window_deg", 2.0)
         self.declare_parameter("log_throttle_sec", 1.0)
 
         self.centroid_topic = self.get_parameter("centroid_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
+        self.scan_topic = self.get_parameter("scan_topic").value
         self.point_topic = self.get_parameter("point_topic").value
         self.pose_topic = self.get_parameter("pose_topic").value
         self.target = self.get_parameter("target").value
         self.event_label = project_detection_message(self.target)
         self.target_frame = self.get_parameter("target_frame").value
         self.camera_frame_parameter = self.get_parameter("camera_frame").value
+        self.lidar_frame_parameter = self.get_parameter("lidar_frame").value
         self.object_diameter_m = float(self.get_parameter("object_diameter_m").value)
         self.assumed_depth_m = float(self.get_parameter("assumed_depth_m").value)
         self.min_pixel_diameter = float(self.get_parameter("min_pixel_diameter").value)
         self.max_range_m = float(self.get_parameter("max_range_m").value)
+        self.lidar_window_deg = float(self.get_parameter("lidar_window_deg").value)
         self.log_throttle_sec = float(self.get_parameter("log_throttle_sec").value)
 
         self.camera_info = None
+        self.latest_scan = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -102,6 +109,15 @@ class TargetLocalizer(Node):
             self.centroid_callback,
             10,
         )
+        if self.scan_topic:
+            self.scan_subscriber = self.create_subscription(
+                LaserScan,
+                self.scan_topic,
+                self.scan_callback,
+                10,
+            )
+        else:
+            self.scan_subscriber = None
 
         self.point_publisher = self.create_publisher(PointStamped, self.point_topic, 10)
         self.pose_publisher = self.create_publisher(PoseStamped, self.pose_topic, 10)
@@ -112,6 +128,9 @@ class TargetLocalizer(Node):
 
     def camera_info_callback(self, msg):
         self.camera_info = msg
+
+    def scan_callback(self, msg):
+        self.latest_scan = msg
 
     def centroid_callback(self, msg):
         if self.camera_info is None:
@@ -159,6 +178,8 @@ class TargetLocalizer(Node):
         self.point_publisher.publish(point_odom)
         self.pose_publisher.publish(pose_odom)
 
+        lidar_text = self.describe_lidar_measurement(point_odom)
+
         self.get_logger().info(
             f"{self.event_label}: "
             f"{self.target_frame}=("
@@ -166,7 +187,8 @@ class TargetLocalizer(Node):
             f"y={point_odom.point.y:.2f}, "
             f"z={point_odom.point.z:.2f}), "
             f"range={depth:.2f} m, "
-            f"image_centroid=({u:.1f},{v:.1f}) px",
+            f"image_centroid=({u:.1f},{v:.1f}) px, "
+            f"{lidar_text}",
             throttle_duration_sec=self.log_throttle_sec,
         )
 
@@ -217,6 +239,84 @@ class TargetLocalizer(Node):
             return None
 
         return transform_point(point_camera, transform)
+
+    def describe_lidar_measurement(self, point_target_frame):
+        if self.latest_scan is None:
+            return "lidar=no scan yet"
+
+        scan_frame = self.lidar_frame_parameter or self.latest_scan.header.frame_id
+        if not scan_frame:
+            return "lidar=no scan frame"
+
+        point_scan = self.to_frame(point_target_frame, scan_frame)
+        if point_scan is None:
+            return f"lidar=missing TF to {scan_frame}"
+
+        # LiDAR gives us a quick sanity check beside the vision-only range
+        x = float(point_scan.point.x)
+        y = float(point_scan.point.y)
+        expected_range = math.hypot(x, y)
+        bearing = math.atan2(y, x)
+
+        beam_range = self.pick_lidar_beam(self.latest_scan, bearing, expected_range)
+        bearing_deg = math.degrees(bearing)
+        if beam_range is None:
+            return (
+                f"lidar=no valid beam near {bearing_deg:.1f} deg, "
+                f"vision_planar_range={expected_range:.2f} m"
+            )
+
+        return (
+            f"lidar={beam_range:.2f} m near {bearing_deg:.1f} deg, "
+            f"vision_planar_range={expected_range:.2f} m"
+        )
+
+    def pick_lidar_beam(self, scan, bearing, expected_range):
+        if scan.angle_increment == 0.0 or not scan.ranges:
+            return None
+
+        center = round((bearing - scan.angle_min) / scan.angle_increment)
+        center = int(center)
+        if center < 0 or center >= len(scan.ranges):
+            return None
+
+        #small window because the Gazebo scan is coarse at 180 beams
+        window = max(
+            0,
+            int(round(math.radians(self.lidar_window_deg) / abs(scan.angle_increment))),
+        )
+        lo = max(0, center - window)
+        hi = min(len(scan.ranges), center + window + 1)
+
+        candidates = []
+        for value in scan.ranges[lo:hi]:
+            if (
+                math.isfinite(value)
+                and value >= scan.range_min
+                and value <= scan.range_max
+            ):
+                candidates.append(float(value))
+
+        if not candidates:
+            return None
+
+        # this picks the beam most consistent with the CV estimate, not just the closest wall
+        return min(candidates, key=lambda value: abs(value - expected_range))
+
+    def to_frame(self, point, frame_id):
+        if point.header.frame_id == frame_id:
+            return point
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                frame_id,
+                point.header.frame_id,
+                Time(),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+
+        return transform_point(point, transform)
 
 
 def main(args=None):
