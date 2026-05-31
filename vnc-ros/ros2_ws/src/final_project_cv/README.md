@@ -14,7 +14,7 @@ The detector recognizes:
 - `bottle` as a heuristic clue
 - `sports ball` as the goal target
 
-The output is intended for the planning and map-merging side of the project: each robot publishes semantic target observations in its own odom frame, plus a LiDAR sanity check at the same target bearing.
+Each robot publishes the raw sensor streams, annotated debug images, and odom-frame target observations. The planning code can subscribe to those topics directly.
 
 ## CV Pipeline
 
@@ -43,9 +43,18 @@ Y = (v - cy) * Z / fy
 
 The localizer then transforms the point into the robot's odom frame and logs the LiDAR range near the same bearing.
 
-## Planning Interface
+## Output Interface
 
-Subscribe to these topics for semantic search and goal handling:
+The raw LiDAR stream is published continuously by Gazebo as `sensor_msgs/LaserScan`:
+
+```text
+/robot1/scan
+/robot2/scan
+```
+
+Those are the general LiDAR topics. The CV localizer also subscribes to the same scans and logs the LiDAR beam closest to the detected target bearing, so the terminal output includes both the vision estimate and the nearby range reading.
+
+The semantic target points are published as `geometry_msgs/PointStamped`:
 
 ```text
 /robot1/heuristic_point_odom
@@ -63,36 +72,14 @@ point.y         = estimated target y in that odom frame
 point.z         = estimated target height/depth component from projection
 ```
 
-Use these topics as semantic observations:
+The meaning of the two classes is:
 
 ```text
-bottle detected      -> boost belief near that odom point
-sports ball detected -> goal found / terminate search or switch to approach behavior
-no detection         -> planning may down-weight currently visible cells
+bottle detected      -> heuristic clue
+sports ball detected -> goal found / sphere detected
 ```
 
-Important frame note: `/robot1/heuristic_point_odom` is in `robot1/odom`, and `/robot2/heuristic_point_odom` is in `robot2/odom`. The map-merging layer must align those odom/map frames before combining target observations into one global belief grid.
-
-## Map-Merging Interface
-
-The CV package does not merge occupancy maps. It provides semantic target observations that can be fused after the mapping layer aligns robot frames.
-
-Expected integration pattern:
-
-```text
-/robot1/scan -> robot1 mapper -> /robot1/SLAM_map
-/robot2/scan -> robot2 mapper -> /robot2/SLAM_map
-
-/robot1/SLAM_map + /robot2/SLAM_map
--> map merger estimates robot2 map transform into robot1/global frame
--> /merged_map
-
-/robot1/heuristic_point_odom + /robot2/heuristic_point_odom
--> transform both semantic observations into merged-map frame
--> update heuristic belief grid
-```
-
-If the map merger chooses `robot1/odom` as the global reference, then robot 1 target points can be used directly and robot 2 target points must be transformed through the estimated map alignment.
+Important frame note: robot 1 target messages are in `robot1/odom`, and robot 2 target messages are in `robot2/odom`.
 
 ## Topics
 
