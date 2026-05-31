@@ -5,6 +5,7 @@ services:
     ipc: host  # This enables Shared Memory communication
     volumes: 
       - ./ros2_ws/src:/root/ros2_ws/src
+      - ./Dataset-of-Gazebo-Worlds-Models-and-Maps:/root/.gazebo/models
     environment:
       - DISPLAY=novnc:0.0
     env_file:
