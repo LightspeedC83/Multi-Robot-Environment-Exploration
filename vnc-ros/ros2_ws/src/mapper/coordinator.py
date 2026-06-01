@@ -126,12 +126,12 @@ class Coordinator(Node):
         # getting request data
         self.get_logger().info(f"received path generation request from {request.requester_name}")
         requester_id = request.requester_id
-        
+        self.get_logger().info(f"requester_name: {request.requester_name}, requester_id: {request.requester_id}")
         #  if id is invalid
         if requester_id <= 0 or requester_id is None:
             response.success = False
             response.message = "Requester has no id"
-            self.get_logger().warn("received path request from robot with no ID")
+            self.get_logger().warn(f"received path request from robot with no ID {requester_id}")
             return response
 
         # generating path
@@ -243,8 +243,8 @@ class Coordinator(Node):
         """retuns x, y, theta, timestamp"""
         timestamp = pose_msg.header.stamp
         
-        x = pose_msg.pose.x
-        y = pose_msg.pose.y
+        x = pose_msg.pose.position.x
+        y = pose_msg.pose.position.y
         quat = pose_msg.pose.orientation
         theta = self.quaternion_to_theta(quat)
 
@@ -296,6 +296,7 @@ class Coordinator(Node):
     ### Code For Path Planning per robot ###
     def single_robot_plan(self, robot_id):
         """broadcasts plans for frontier exploraiton of a single robot, returns true if path was broadcasted, false if no path found"""
+        self.get_logger().info("starting map generation")
 
         if robot_id not in self.map_msgs:
             self.get_logger().warn(f"No map yet for robot {robot_id}")
@@ -328,7 +329,7 @@ class Coordinator(Node):
         pose_arr_msg.header.stamp = self.get_clock().now().to_msg()
         pose_arr_msg.header.frame_id = self.map_msgs[robot_id].header.frame_id # assigning the frame id as the same as received
         pose_arr_msg.poses = []
-        for pt in path_odom:
+        for pt in path_odom[1:]: # skipping the first point so it's not crazy
             pose = Pose()
             pose.position.x = pt[0]
             pose.position.y = pt[1]
@@ -338,15 +339,17 @@ class Coordinator(Node):
         # now publish
         pose_pub = self.path_publishers_dictionary[robot_id]
         pose_pub.publish(pose_arr_msg)
+        self.get_logger().info(f"published nav path for robot_{robot_id}")
         return True
 
 
     def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell):
         """returns a list of map cell coordinates connecting the pos_map point with the best frontier"""
-
+        self.get_logger().info("starting frontier path generation")
+        
         # getting current location
         start_point = x_pos_map, y_pos_map
-                
+        self.get_logger().info(f"start pt {start_point}")
         SLAM_map_to_use = map
             
         # smoothing the SLAM map so that we dont' run into any walls (ie. obstacle inflation)
@@ -362,17 +365,18 @@ class Coordinator(Node):
         obstacle_avoidance_search_map[free_cells] = smoothed_SLAM_map[free_cells]
 
         # self.get_logger().info(obstacle_avoidance_search_map)
-        # np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
+        np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
-        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
+        # start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
 
         # getting the goal point
-        ranked_frontiers = self.rank_frontiers(map, x_pos_map, y_pos_map, map_width, map_height) 
-        goal_point = ranked_frontiers[0][0] # best frontier (one with lowest score will be first in list, and it's index 0 in the pt,score tuple)
+        ranked_frontiers = self.rank_frontiers(obstacle_avoidance_search_map, x_pos_map, y_pos_map, map_width, map_height) 
         if len(ranked_frontiers) == 0:
             self.get_logger().warn("No frontiers found")
             return None
-    
+        goal_point = ranked_frontiers[0][0] # best frontier (one with lowest score will be first in list, and it's index 0 in the pt,score tuple)
+        self.get_logger().info(f"frontier pt {goal_point} value {obstacle_avoidance_search_map[goal_point[1]][goal_point[0]]}")
+        
         # A* to find the best path to the goal frontier point
 
         # list of relative neighbors to a node
@@ -394,7 +398,6 @@ class Coordinator(Node):
         while len(priority_queue) != 0:
             self.a_star_count+=1
             _, _, nextup = heapq.heappop(priority_queue)
-            seen_cells[nextup.y][nextup.x] = True # mark as visited
 
             # checking if the next cell is the goal
             if nextup.y == goal_point[1] and nextup.x == goal_point[0]: # if we've found the goal point
@@ -418,8 +421,10 @@ class Coordinator(Node):
     
                         heapq.heappush(priority_queue, (weight, counter, neighbor_node))
                         counter +=1
+                        seen_cells[y_n][x_n] = True # mark as visited
                         
-
+        self.get_logger().info("starting finished A*")
+        
         if goal_node is None: # if we coudn't find the goal node
             self.get_logger().warn("Planner: A* search not able to find a reachable goal; all frontiers explored")
             return(None)
@@ -495,7 +500,7 @@ class Coordinator(Node):
 
     def is_frontier_cell(self, map, x, y, map_width, map_height):
         """returns true if the inputted point is free space on SLAM map and next to -1"""
-        if map[y][x] >= MAP_CLEAR_THRESHOLD and map[y][x] != -1 :
+        if map[y][x] >= MAP_OCCUPIED_THRESHOLD and map[y][x] != -1 :
             return False # if occupied or unexplored, not frontier cell...
         
         # list of relative neighbors to a node
@@ -560,7 +565,7 @@ class Coordinator(Node):
         max_val = np.max(self.smoothedMap) # find teh largest value in the map
 
         # Scale everything proportionally
-        if max_val == 0:
+        if max_val != 0:
             scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
         else:
             scaled = self.smoothedMap

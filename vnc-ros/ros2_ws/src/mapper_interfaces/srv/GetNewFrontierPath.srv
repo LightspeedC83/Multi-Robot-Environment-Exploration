@@ -3,7 +3,7 @@
 # request  goes on this sie of the --- (response on the other side)
 
 string requester_name
-uint64 requester_id 
+int32 requester_id 
 ---
 bool success
 string message
