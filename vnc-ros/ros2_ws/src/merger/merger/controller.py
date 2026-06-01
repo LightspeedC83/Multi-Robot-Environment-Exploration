@@ -43,6 +43,7 @@ MIN_CELLS_BEFORE_FIRST_TRY = 1000  # don't bother before either robot has seen t
 COORDINATION_PERIOD_SEC = 5.0
 MAP_SUBTOPIC = 'SLAM_map'
 ANCHOR_ROBOT_ID = 'robot1'
+DEFAULT_MAP_TOPIC_TEMPLATE = '/SLAM_map_{id}'
 
 # Helpers
 
@@ -129,7 +130,7 @@ def build_node():
 
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from nav_msgs.msg import OccupancyGrid
     from geometry_msgs.msg import TransformStamped
     from tf2_ros import StaticTransformBroadcaster
@@ -141,6 +142,8 @@ def build_node():
 
             self.declare_parameter('confidence_threshold', DEFAULT_CONFIDENCE_THRESH)
             self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
+            self.declare_parameter('map_topic_template', DEFAULT_MAP_TOPIC_TEMPLATE)
+            self.map_topic_template = str(self.get_parameter('map_topic_template').value)
 
             self.robot_states: Dict[str, RobotMapState] = {}
             # Currently-known transforms between robot odom frames. Key:
@@ -151,6 +154,7 @@ def build_node():
 
             qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1,
             )
@@ -192,8 +196,8 @@ def build_node():
             # Add state tracker for this robot
             self.robot_states[robot_id] = RobotMapState(robot_id)
 
-            # Subscribe to this robot's map topic  e.g. /robot1/map
-            topic = f'/{robot_id}/{MAP_SUBTOPIC}'
+            # Subscribe to the mapper's global map topic, e.g. /SLAM_map_1.
+            topic = self.map_topic_template.format(id=integer_id, robot_id=robot_id)
             self.get_logger().info(f'New robot registered: {robot_id}, subscribing to {topic}')
 
             sub = self.create_subscription(
@@ -338,9 +342,17 @@ def build_node():
             # We rotate first, then translate when mapping a point from
             # follower's odom frame to anchor's odom frame. Build a 3D
             # transform_stamped accordingly.
-            tx = tm['tx']
-            ty = tm['ty']
             theta = tm['theta']
+            c = math.cos(theta)
+            s = math.sin(theta)
+
+            anchor = self.robot_states[anchor_id]
+            follower = self.robot_states[follower_id]
+
+            # Conversion from grid cells to odom includes each local map's
+            # origin, so the metric transform is not just pixel translation.
+            tx = anchor.origin_x + tm['tx'] - (c * follower.origin_x - s * follower.origin_y)
+            ty = anchor.origin_y + tm['ty'] - (s * follower.origin_x + c * follower.origin_y)
 
             t = TransformStamped()
             t.header.stamp = self.get_clock().now().to_msg()

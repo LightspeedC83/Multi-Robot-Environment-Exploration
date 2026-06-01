@@ -1,87 +1,34 @@
-# Computer Vision Target Localization
+# final_project_cv
 
-This package is the CV interface for the multi-robot exploration project. It runs in the `vnc-ros` Docker workspace and provides a lightweight Gazebo world with two robots, each with:
+Computer-vision and simulation package for the integrated two-robot demo. It provides the Gazebo world, target detectors, target localizers, RViz config, and launch files used by the mapper/coordinator stack.
 
-- RGB camera
-- 2D LiDAR
-- odometry
-- differential-drive `cmd_vel`
-- YOLO/FastSAM target detection
-- odom-frame target localization
+## Targets
 
-The detector recognizes:
+- `sports ball`: goal target.
+- `bottle`: heuristic clue used only before the goal is found.
 
-- `bottle` as a heuristic clue
-- `sports ball` as the goal target
+Once a goal observation exists, the coordinator ignores heuristic detections and sends both robots toward the goal.
 
-Each robot publishes the raw sensor streams, annotated debug images, and odom-frame target observations. The planning code can subscribe to those topics directly.
+## Detection And Localization
 
-## CV Pipeline
+Each robot runs two detector/localizer pairs:
 
 ```text
 camera image
--> YOLO bounding box
--> FastSAM mask refinement
--> centroid and observed pixel diameter
--> monocular depth estimate
--> target point in robot odom frame
--> matching LiDAR beam check
+-> detector bounding box / centroid
+-> target localizer
+-> odom-frame PointStamped target
 ```
 
-Depth is estimated from the apparent target size:
+The localizer prefers the LiDAR beam at the camera-centroid bearing when that range is consistent with the visual size estimate. If the beam is likely an obstacle or self-hit, it falls back to the visual estimate and logs the rejected LiDAR range.
+
+Example log:
 
 ```text
-Z = f * D / d_px
+goal found sphere detected: robot1/odom=(x=..., y=..., z=...), range=..., lidar=... m near ... deg, image_centroid=(...), vision_planar_range=...
 ```
 
-where `D` is the assumed real object diameter and `d_px` is the observed diameter in pixels. The centroid is back-projected with:
-
-```text
-X = (u - cx) * Z / fx
-Y = (v - cy) * Z / fy
-```
-
-The localizer then transforms the point into the robot's odom frame and logs the LiDAR range near the same bearing.
-
-## Output Interface
-
-The raw LiDAR stream is published continuously by Gazebo as `sensor_msgs/LaserScan`:
-
-```text
-/robot1/scan
-/robot2/scan
-```
-
-Those are the general LiDAR topics. The CV localizer also subscribes to the same scans and logs the LiDAR beam closest to the detected target bearing, so the terminal output includes both the vision estimate and the nearby range reading.
-
-The semantic target points are published as `geometry_msgs/PointStamped`:
-
-```text
-/robot1/heuristic_point_odom
-/robot1/goal_point_odom
-/robot2/heuristic_point_odom
-/robot2/goal_point_odom
-```
-
-Each message is a `geometry_msgs/PointStamped`.
-
-```text
-header.frame_id = robot1/odom or robot2/odom
-point.x         = estimated target x in that odom frame
-point.y         = estimated target y in that odom frame
-point.z         = estimated target height/depth component from projection
-```
-
-The meaning of the two classes is:
-
-```text
-bottle detected      -> heuristic clue
-sports ball detected -> goal found / sphere detected
-```
-
-Important frame note: robot 1 target messages are in `robot1/odom`, and robot 2 target messages are in `robot2/odom`.
-
-## Topics
+## Main Topics
 
 Robot 1:
 
@@ -111,144 +58,57 @@ Robot 2:
 /robot2/goal_point_odom
 ```
 
-## Run The Two-Robot Demo
+Target messages are `geometry_msgs/PointStamped` in the corresponding robot odom frame, such as `robot1/odom` or `robot2/odom`.
 
-Start Docker from the host machine:
+## Run
 
-```bash
-cd ~/Dartmouth/Robotics/vnc-ros
-docker compose up -d
-docker compose exec ros bash
-```
-
-Build:
+Integrated project demo:
 
 ```bash
 cd /root/ros2_ws
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select final_project_cv
+colcon build --symlink-install
 source install/setup.bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-Terminal 1, Gazebo:
+Gazebo world only:
 
 ```bash
-cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
 ros2 launch final_project_cv lightweight_targets_gazebo.launch.py
 ```
 
-Terminal 2, robot 1 CV:
+CV pipeline for one robot:
 
 ```bash
-cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py \
-  robot_namespace:=robot1 \
-  process_every_n:=2 \
-  use_fastsam:=true
+ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py robot_namespace:=robot1
 ```
 
-Terminal 3, robot 2 CV:
+Lower-load integrated run:
 
 ```bash
-cd /root/ros2_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py \
-  robot_namespace:=robot2 \
-  process_every_n:=2 \
-  use_fastsam:=true
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=3 use_fastsam:=false
 ```
 
-Running both CV pipelines is heavier because it starts two YOLO/FastSAM stacks. If the laptop slows down, set `process_every_n:=3` or run CV for one robot at a time.
+## Visualization
 
-Terminal 4, image viewer:
+RViz:
+
+```bash
+rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
+```
+
+Camera overlays:
 
 ```bash
 ros2 run rqt_image_view rqt_image_view
 ```
 
-Useful debug images:
+Useful debug topics:
 
 ```text
-/robot1/heuristic_debug_image
 /robot1/goal_debug_image
-/robot2/heuristic_debug_image
 /robot2/goal_debug_image
+/robot1/heuristic_debug_image
+/robot2/heuristic_debug_image
 ```
-
-Terminal 5, robot 1 teleop:
-
-```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot1/cmd_vel
-```
-
-Terminal 6, robot 2 teleop:
-
-```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/robot2/cmd_vel
-```
-
-Teleop controls:
-
-```text
-i   forward
-,   backward
-j   turn left
-l   turn right
-k   stop
-q   increase speed
-z   decrease speed
-```
-
-## Inspect Outputs
-
-Target points:
-
-```bash
-ros2 topic echo /robot1/heuristic_point_odom
-ros2 topic echo /robot1/goal_point_odom
-ros2 topic echo /robot2/heuristic_point_odom
-ros2 topic echo /robot2/goal_point_odom
-```
-
-LiDAR:
-
-```bash
-ros2 topic echo /robot1/scan
-ros2 topic echo /robot2/scan
-```
-
-Topic list:
-
-```bash
-ros2 topic list | grep -E "robot1|robot2|camera|scan|heuristic|goal|odom|cmd_vel"
-```
-
-Expected CV/localizer logs:
-
-```text
-heuristics detected: robot1/odom=(x=..., y=..., z=...), range=..., image_centroid=(...), lidar=... m near ... deg, vision_planar_range=... m
-
-goal found sphere detected: robot2/odom=(x=..., y=..., z=...), range=..., image_centroid=(...), lidar=... m near ... deg, vision_planar_range=... m
-```
-
-The LiDAR value is not another classifier. It is the LaserScan range at the bearing where the CV-estimated target point should be, useful for checking whether the monocular depth estimate is plausible.
-
-## Clean Restart
-
-If Gazebo, TF, or FastDDS gets noisy after several restarts:
-
-```bash
-pkill -f gazebo || true
-pkill -f gzserver || true
-pkill -f gzclient || true
-pkill -f rqt_image_view || true
-rm -f /dev/shm/fastrtps_* /dev/shm/fastdds_*
-rm -f ~/.gazebo/gui.ini
-```
-
-Then rebuild and relaunch.

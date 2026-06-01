@@ -13,6 +13,7 @@ def generate_launch_description():
     target_frame = LaunchConfiguration("target_frame")
     camera_frame = LaunchConfiguration("camera_frame")
     yolo_conf = LaunchConfiguration("yolo_conf")
+    use_yolo = LaunchConfiguration("use_yolo")
     use_fastsam = LaunchConfiguration("use_fastsam")
     fastsam_weights = LaunchConfiguration("fastsam_weights")
     fastsam_conf = LaunchConfiguration("fastsam_conf")
@@ -31,6 +32,7 @@ def generate_launch_description():
         DeclareLaunchArgument("target_frame", default_value="odom"),
         DeclareLaunchArgument("camera_frame", default_value=""),
         DeclareLaunchArgument("yolo_conf", default_value="0.25"),
+        DeclareLaunchArgument("use_yolo", default_value="true"),
         DeclareLaunchArgument("use_fastsam", default_value="true"),
         DeclareLaunchArgument("fastsam_weights", default_value="FastSAM-s.pt"),
         DeclareLaunchArgument("fastsam_conf", default_value="0.4"),
@@ -49,6 +51,7 @@ def generate_launch_description():
                 "image_topic": image_topic,
                 "target": target,
                 "centroid_topic": "/target_centroid",
+                "use_yolo": ParameterValue(use_yolo, value_type=bool),
                 "use_fastsam": ParameterValue(use_fastsam, value_type=bool),
                 "fastsam_weights": fastsam_weights,
                 "fastsam_conf": ParameterValue(fastsam_conf, value_type=float),

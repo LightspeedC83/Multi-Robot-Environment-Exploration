@@ -199,6 +199,7 @@ class VisionTargetDetector(Node):
         self.declare_parameter("centroid_topic", "/target_centroid")
         self.declare_parameter("debug_image_topic", "/target_debug_image")
         self.declare_parameter("target", "bottle")
+        self.declare_parameter("use_yolo", True)
         self.declare_parameter("yolo_weights", "yolo11n.pt")
         self.declare_parameter("fastsam_weights", "FastSAM-s.pt")
         self.declare_parameter("use_fastsam", False)
@@ -223,6 +224,7 @@ class VisionTargetDetector(Node):
         self.centroid_topic = self.get_parameter("centroid_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
         self.target = self.get_parameter("target").value
+        self.use_yolo = parameter_as_bool(self.get_parameter("use_yolo").value)
         self.yolo_weights = resolve_model_path(self.get_parameter("yolo_weights").value)
         self.fastsam_weights = resolve_model_path(self.get_parameter("fastsam_weights").value)
         self.use_fastsam = parameter_as_bool(self.get_parameter("use_fastsam").value)
@@ -253,7 +255,7 @@ class VisionTargetDetector(Node):
 
         self.bridge = CvBridge()
         self.configure_torch_threads()
-        self.detector = load_yolo_model(self.yolo_weights)
+        self.detector = load_yolo_model(self.yolo_weights) if self.use_yolo else None
         self.fuse_detector_if_requested()
         self.segmenter = load_fastsam_model(self.fastsam_weights) if self.use_fastsam else None
         self.frame_count = 0
@@ -291,7 +293,7 @@ class VisionTargetDetector(Node):
             self.get_logger().debug(f"Could not configure torch thread count: {exc}")
 
     def fuse_detector_if_requested(self):
-        if not self.fuse_yolo_model:
+        if self.detector is None or not self.fuse_yolo_model:
             return
 
         try:
@@ -307,15 +309,17 @@ class VisionTargetDetector(Node):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         processed_frame, scale = resize_to_width(frame, self.process_width)
 
-        yolo_results = self.detector(
-            processed_frame,
-            conf=self.yolo_conf,
-            imgsz=self.imgsz,
-            verbose=False,
-        )
-        all_detections = self.get_all_detections(yolo_results[0])
+        all_detections = []
+        if self.detector is not None:
+            yolo_results = self.detector(
+                processed_frame,
+                conf=self.yolo_conf,
+                imgsz=self.imgsz,
+                verbose=False,
+            )
+            all_detections.extend(self.get_all_detections(yolo_results[0]))
         if self.use_sim_bottle_color_fallback:
-            all_detections.extend(self.detect_sim_bottles(processed_frame))
+            all_detections.extend(self.detect_sim_color_targets(processed_frame))
 
         visible_detections = [
             detection for detection in all_detections
@@ -425,15 +429,41 @@ class VisionTargetDetector(Node):
 
         return detections
 
-    def detect_sim_bottles(self, frame):
+    def detect_sim_color_targets(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # The lightweight Gazebo bottles are deliberately cyan/blue. This
         # fallback is only for the synthetic world where pretrained YOLO does
-        # not see simple cylinder models as real bottles.
+        # not see simple cylinder models as real bottles. The goal ball is
+        # deliberately orange for the same reason.
         lower_blue = np.array([82, 45, 35], dtype=np.uint8)
         upper_blue = np.array([112, 255, 235], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        lower_orange = np.array([4, 70, 70], dtype=np.uint8)
+        upper_orange = np.array([25, 255, 255], dtype=np.uint8)
+
+        detections = []
+        detections.extend(self.detect_sim_color_components(
+            hsv,
+            lower_blue,
+            upper_blue,
+            class_name="bottle",
+            min_area=self.sim_bottle_min_area,
+            require_tall=True,
+            confidence=0.95,
+        ))
+        detections.extend(self.detect_sim_color_components(
+            hsv,
+            lower_orange,
+            upper_orange,
+            class_name="sports ball",
+            min_area=12.0,
+            require_tall=False,
+            confidence=0.92,
+        ))
+        return detections
+
+    def detect_sim_color_components(self, hsv, lower, upper, class_name, min_area, require_tall, confidence):
+        mask = cv2.inRange(hsv, lower, upper)
 
         kernel = np.ones((3, 3), dtype=np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -444,11 +474,13 @@ class VisionTargetDetector(Node):
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < self.sim_bottle_min_area:
+            if area < min_area:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
-            if h < 10 or w < 3 or h < 1.35 * w:
+            if h < 3 or w < 3:
+                continue
+            if require_tall and (h < 10 or h < 1.35 * w):
                 continue
 
             component_mask = np.zeros(mask.shape, dtype=np.uint8)
@@ -459,9 +491,9 @@ class VisionTargetDetector(Node):
 
             detections.append({
                 "bbox": bbox,
-                "confidence": 0.95,
+                "confidence": confidence,
                 "class_id": -1,
-                "class_name": "bottle",
+                "class_name": class_name,
                 "source": "sim_color",
                 "mask": component_mask.astype(np.float32) / 255.0,
             })

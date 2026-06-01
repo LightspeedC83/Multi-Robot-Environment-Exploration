@@ -1,16 +1,14 @@
 #!/usr/bin/env python
 #The line above is important so that this file is interpreted with Python when running it.
 
-# Author: Charles Lowney (built on code from my PA3 submission)
-# Date: 5/10/26
-
-# This Python Program implements a SLAM in a robot
+# Multi-robot mapper/controller node.
 
 # Import of python modules.
 import math # use of pi.
 import random # use for generating a random real number
 from enum import Enum
 import time
+import functools
 import numpy as np # for map grid representations and operations
 from anytree import Node as TreeNode # for search algorithms (so important to import as Tree node because we have a Node class from ros2 already
 import heapq # for A*
@@ -19,10 +17,12 @@ import heapq # for A*
 import rclpy # module for ROS APIs
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.clock import Clock, ClockType
 from rclpy.signals import SignalHandlerOptions
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist # message type for cmd_vel
 from sensor_msgs.msg import LaserScan # message type for scan
-from nav_msgs.msg import OccupancyGrid # message type for occupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry # message type for occupancyGrid
 from  nav_msgs.msg import MapMetaData # for the slam_map msg.info
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray, Point, Quaternion # for the ifnromation stored in slam_map msg.info and a lot of communication with coordinator
 from tf2_ros import TransformListener, Buffer
@@ -41,13 +41,16 @@ DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
 DEFAULT_SCAN_TOPIC = 'base_scan' # name of laserscan topic for Stage simulator. For Gazebo, 'scan'
 OCCUPANCY_GRID_TOPIC = 'nav_msgs/OccupancyGrid'
 DEFAULT_SERVICE_NAME = 'on_off'
+DEFAULT_ODOM_FRAME = 'rosbot/odom'
+DEFAULT_BASE_FRAME = 'rosbot/base_link'
+DEFAULT_LASER_FRAME = 'rosbot/laser'
 
 # Frequency at which the loop operates
 FREQUENCY = 100 #Hz.
 
 # Parameters
 LINEAR_VELOCITY = 0.5 # m/s
-ANGULAR_VELOCITY = 0.2 # rad/s
+ANGULAR_VELOCITY = 0.55 # rad/s
 
 SLAM_MAP_RESOLUTION_SCALAR = 10 # number of cells in the SLAM map per meter
 
@@ -58,12 +61,20 @@ CELL_PROBABILITY_OCCUPIED = 70 # the minimum probability a cell has to have to b
 SCAN_DOWNSAMPLING = 1 # the robot will process every nth scan (this value is n) so 1=process every scan, 2=process every other scan...
 SMOOTHING_KERNEL_SIZE = 10  # the kernel size applied to the gaussian smoothing algorithm
 SMOOTHING_SIGMA = 6 # The standard deviation applied to the gaussian smoothing algorithm
-
 MAP_CLEAR_THRESHOLD = 33 # program treats any value below this as free space
 MAP_OCCUPIED_THRESHOLD = 80 # program treats any value above this as occupied and to be avoided
 
 PROTECTION_RADIUS = 0.3 # [m] The radius within which the robot will stop if it detects something, then it will wait and find a new path to nearest frontier
-LASER_SLEEP_TIME_AFTER_INTERRUPT = 60 # [s] the time that the robot will wait after almost running into something so that it doesn't get stuck too close 
+FORWARD_PROTECTION_ANGLE_RAD = math.radians(45)
+EMERGENCY_PROTECTION_RADIUS = 0.12 # [m]
+LASER_SLEEP_TIME_AFTER_INTERRUPT = 2 # [s] short cooldown after local escape, not a minute-long trap
+ESCAPE_BACKUP_TIME = 0.8 # [s]
+ESCAPE_TURN_TIME = 1.1 # [s]
+ESCAPE_BACKUP_VELOCITY = -0.18 # [m/s]
+ESCAPE_FORWARD_VELOCITY = 0.16 # [m/s]
+ESCAPE_TURN_VELOCITY = 0.35 # [rad/s]
+STUCK_PROGRESS_EPS = 0.03 # [m]
+STUCK_WATCHDOG_SEC = 2.2 # [s]
 
 USE_SIM_TIME = True
 STARTUP_TIMEOUT = 15.0 # s. Max wait for simulator/controller startup.
@@ -79,6 +90,7 @@ class recovery_fsm(Enum):
     FINE = 0
     WAITING_FOR_PATH = 1
     EXECUTING_PATH = 2
+    ESCAPING = 3
 
 class local_fsm(Enum):
     IDLE = 0
@@ -86,17 +98,11 @@ class local_fsm(Enum):
     MOVING = 2
 
 
-NEIGHBOR_LIST = [  # list of relative neighbors to a node
+NEIGHBOR_LIST = [
         (-1,1),  (0,1),  (1,1),
         (-1,0),          (1,0),
-        (-1,-1), (0,-1), (1,-1)  
-        ]     
-# NEIGHBOR_LIST = [
-#                   (0,1),
-#         (-1,0),          (1,0),
-#                 (0,-1),  
-#         ] 
-
+        (-1,-1), (0,-1), (1,-1)
+        ]
 
 
 class WorldMapper(Node):
@@ -120,42 +126,88 @@ class WorldMapper(Node):
         )
         self.set_parameters([use_sim_time_param])
 
+        self.declare_parameter("cmd_vel_topic", DEFAULT_CMD_VEL_TOPIC)
+        self.declare_parameter("scan_topic", DEFAULT_SCAN_TOPIC)
+        self.declare_parameter("odom_topic", "")
+        self.declare_parameter("odom_frame", DEFAULT_ODOM_FRAME)
+        self.declare_parameter("base_frame", DEFAULT_BASE_FRAME)
+        self.declare_parameter("laser_frame", DEFAULT_LASER_FRAME)
+        self.declare_parameter("map_frame", DEFAULT_ODOM_FRAME)
+        self.declare_parameter("id_service_name", "/get_unique_id")
+        self.declare_parameter("path_service_name", "/get_path")
+        self.declare_parameter("map_topic_template", "/SLAM_map_{id}")
+        self.declare_parameter("pose_topic_template", "/pose_{id}")
+        self.declare_parameter("path_topic_template", "/nav_path_{id}")
+        self.declare_parameter("active_topic_template", "/id_active_{id}")
+        self.declare_parameter("mission_complete_topic", "/mission_complete")
+        self.declare_parameter("stop_on_mission_complete", True)
+
+        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
+        self.scan_topic = self.get_parameter("scan_topic").value
+        self.odom_topic = self.get_parameter("odom_topic").value
+        self.odom_frame = self.get_parameter("odom_frame").value
+        self.base_frame = self.get_parameter("base_frame").value
+        self.laser_frame = self.get_parameter("laser_frame").value
+        self.map_frame = self.get_parameter("map_frame").value or self.odom_frame
+        self.id_service_name = self.get_parameter("id_service_name").value
+        self.path_service_name = self.get_parameter("path_service_name").value
+        self.map_topic_template = self.get_parameter("map_topic_template").value
+        self.pose_topic_template = self.get_parameter("pose_topic_template").value
+        self.path_topic_template = self.get_parameter("path_topic_template").value
+        self.active_topic_template = self.get_parameter("active_topic_template").value
+        self.mission_complete_topic = self.get_parameter("mission_complete_topic").value
+        self.stop_on_mission_complete = self.get_parameter("stop_on_mission_complete").value
+
         ## getting this robot's ID ##
-        self.id_client = self.create_client(GetUniqueID, 'get_unique_id')
+        self.id_client = self.create_client(GetUniqueID, self.id_service_name)
         self.id = self.request_id("mapper")
+        self.robot_id_name = f"robot{self.id}" if self.id is not None else "robot_NO_ID"
 
         ## setting up service clients ##
-        self.nav_path_client = self.create_client(GetNewFrontierPath, 'get_path') # getting path from coordinator
-        self.nav_path_listener = self.create_subscription(PoseArray, f"nav_path_{self.id}", self._nav_path_callback, 1)
+        self.nav_path_client = self.create_client(GetNewFrontierPath, self.path_service_name) # getting path from coordinator
+        self.nav_path_listener = self.create_subscription(PoseArray, self._topic_from_template(self.path_topic_template), self._nav_path_callback, 1)
+        self._mission_complete_sub = self.create_subscription(Bool, self.mission_complete_topic, self._mission_complete_callback, 1)
+        self.waiting_for_path_request = False
 
         ### Setting up publishers/subscribers. ###
 
         # Setting up the publisher to send velocity commands.
-        self._cmd_pub = self.create_publisher(Twist, DEFAULT_CMD_VEL_TOPIC, 1)
+        self._cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 1)
 
         # Setting up subscriber receiving messages from the laser.
-        self._laser_sub = self.create_subscription(LaserScan, DEFAULT_SCAN_TOPIC, self._laser_callback, 1)
+        self._laser_sub = self.create_subscription(LaserScan, self.scan_topic, self._laser_callback, 1)
+        self.latest_odom_msg = None
+        if self.odom_topic:
+            self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
+        else:
+            self._odom_sub = None
 
         # Setting up a publisher to publish the map data the robot creates
         if not self.id is None:
-            self.map_publish_topic_name = f'/SLAM_map_{self.id}'
+            self.map_publish_topic_name = self._topic_from_template(self.map_topic_template)
         else:
             self.map_publish_topic_name = '/SLAM_map_NO_ID'   
             self._fsm = fsm.OFF # turning off the robot 
         
-        self._SLAM_map_pub = self.create_publisher(OccupancyGrid, self.map_publish_topic_name, 1)
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        #  map remembering: RViz usually joins late, so keep the newest grid available.
+        self._SLAM_map_pub = self.create_publisher(OccupancyGrid, self.map_publish_topic_name, map_qos)
         
         # setting up a publisher to publish the current position of the robot
         if not self.id is None:
-            self.pose_publish_topic_name = f'/pose_{self.id}'
+            self.pose_publish_topic_name = self._topic_from_template(self.pose_topic_template)
         else:
             self.pose_publish_topic_name = '/pose_NO_ID'  
 
         self._pose_pub = self.create_publisher(PoseStamped, self.pose_publish_topic_name, 1)
         
-        
         # setting up a publisher to publish whether this ID is active
-        self._id_active_pub = self.create_publisher(Bool, f"id_active_{self.id}", 1)
+        self._id_active_pub = self.create_publisher(Bool, self._topic_from_template(self.active_topic_template), 1)
         
         id_active_msg = Bool()
         id_active_msg.data = True
@@ -165,10 +217,7 @@ class WorldMapper(Node):
 
         # setting up on/off service
         self._on_off_service = self.create_service(SetBool, f'{node_name}/{DEFAULT_SERVICE_NAME}', self._turn_on_off_callback)
-        
-        # state machine
         self._fsm = fsm.ON
-        self._recovery_fsm = recovery_fsm.FINE
         self._local_fsm = local_fsm.IDLE
 
          
@@ -196,14 +245,25 @@ class WorldMapper(Node):
         self.scan_downsampling_count = self.SCAN_DOWNSAMPLING # value used to keep track of scans for skipping them
 
         self.nav_path = None # This is the path of points (in robot/odom coordinates) to the nearest frontier node
+        self.last_received_nav_path = None
         self.last_nav_path_timestamp = rclpy.time.Time()
+        self.next_path_retry_time = self.get_clock().now()
+        self.next_path_retry_wall_time = 0.0
+        self.awaiting_nav_path_after_success = False
+        self.pose_warning_count = 0
         
 
         self.PROTECTION_RADIUS = PROTECTION_RADIUS
         self.done_time_for_laser_wait = self.get_clock().now()
-        # self._recovery_fsm = recovery_fsm.FINE
+        self._recovery_fsm = recovery_fsm.FINE
         self.recovery_path_executed = False
         self.recovery_path = None
+        self.escape_stage = None
+        self.escape_done_wall_time = 0.0
+        self.escape_turn_direction = 1.0
+        self.escape_linear_velocity = ESCAPE_BACKUP_VELOCITY
+        self.motion_watchdog_pose = None
+        self.motion_watchdog_wall_time = time.monotonic()
 
         # parameters for local level robot rotational and translational speed
         self.LINEAR_VELOCITY = LINEAR_VELOCITY
@@ -211,12 +271,45 @@ class WorldMapper(Node):
 
         # parameters for controlling local motion of robot
         self.done = False # if the robot has mapped its whole environment
+        self.mission_complete_logged = False
         self.busy = False # if busy is true, then the robot is in the midst of an action
         self.action_done_time = self.get_clock().now() # this is the time at which the current action being excecuted will be finished
+        self.next_motion_log_wall_time = 0.0
 
         # setting up transfer frames
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+
+    def _topic_from_template(self, template):
+        """Fill the mapper/coordinator topic templates for this assigned robot."""
+        return str(template).format(id=self.id, robot_id=self.robot_id_name)
+
+    def _odom_callback(self, msg):
+        """Keep the latest Gazebo odometry around for pose publication and control."""
+        self.latest_odom_msg = msg
+
+    def _mission_complete_callback(self, msg):
+        """Stop local exploration once the coordinator has a final demo path."""
+        if not msg.data:
+            return
+
+        if not self.stop_on_mission_complete:
+            #  demo continuing: the final path is published, but movement still looks better on video.
+            if not self.mission_complete_logged:
+                self.get_logger().info("Mission complete received; continuing exploration")
+                self.mission_complete_logged = True
+            return
+
+        # The final path is already published by the coordinator; optional stopping keeps the robots still.
+        self.done = True
+        self.busy = False
+        self.nav_path = None
+        self._fsm = fsm.OFF
+        self._local_fsm = local_fsm.IDLE
+        self.stop()
+        if not self.mission_complete_logged:
+            self.get_logger().info("Mission complete received; stopping exploration")
+            self.mission_complete_logged = True
 
 
     def request_id(self, requester_name):
@@ -239,36 +332,54 @@ class WorldMapper(Node):
             return None
 
     def request_path(self, id):
-        """requests a new path from the coordinator for this robot, non-blocking"""
-        self.get_logger().info(f"Requesting path with id {id}")
-        # waiting for service to become live
-        while not self.nav_path_client.wait_for_service(timeout_sec=1.0):
+        """Ask the coordinator for a new planner path without blocking callbacks."""
+        if self.waiting_for_path_request:
+            return True
+
+        if not self.nav_path_client.service_is_ready():
             self.get_logger().info(f"robot{id} waiting for path service...")
-        # making the request
+            if not self.nav_path_client.wait_for_service(timeout_sec=0.1):
+                return False
+
         request = GetNewFrontierPath.Request()
         request.requester_name = f"robot_{id}"
-        request.requester_id = id
-        # sending the request asynchronously so we don't block the executor
-        # (blocking with spin_until_future_complete would deadlock because the coordinator
-        # needs the executor running to send its response back to us)
+        request.requester_id = int(id)
+
+        self.waiting_for_path_request = True
         future = self.nav_path_client.call_async(request)
-        future.add_done_callback(self._path_request_done_callback)
+        future.add_done_callback(functools.partial(self._path_response_callback, requester_id=id))
+        return True
 
-    def _path_request_done_callback(self, future):
-        """callback for when the path request service response arrives"""
-        if future.result() is not None:
-            self.get_logger().info(f"path request result: {future.result().success}, {future.result().message}")
-            if not future.result().success:
-                self.get_logger().warn("Path request failed, retrying in 5s...")
-                self._retry_timer = self.create_timer(5.0, self._retry_path_request)
-        else:
-            self.get_logger().error('Path service call failed')
-            self._retry_timer = self.create_timer(5.0, self._retry_path_request)
+    def _path_response_callback(self, future, requester_id):
+        """Handle planner service responses after the path topic callback lands."""
+        self.waiting_for_path_request = False
 
-    def _retry_path_request(self):
-        """one-shot retry callback — cancels itself after firing"""
-        self._retry_timer.cancel()
-        self.request_path(self.id)
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"path service call failed for robot{requester_id}: {exc}")
+            return
+
+        if result is None:
+            self.get_logger().error(f"path service returned nothing for robot{requester_id}")
+            return
+
+        if result.success:
+            self.get_logger().info(result.message)
+            #  path message catching: service success can arrive before the one-shot PoseArray does.
+            self.awaiting_nav_path_after_success = True
+            self.next_path_retry_time = self.get_clock().now() + Duration(seconds=0.8)
+            self.next_path_retry_wall_time = time.monotonic() + 0.8
+            return
+
+        self.get_logger().warn(result.message)
+        self.next_path_retry_time = self.get_clock().now() + Duration(seconds=1.0)
+        self.next_path_retry_wall_time = time.monotonic() + 1.0
+        if self._fsm == fsm.RECOVERY:
+            self._recovery_fsm = recovery_fsm.FINE
+            self._fsm = fsm.ON
+        elif self._fsm == fsm.WAITING_FOR_PATH:
+            self.stop()
 
     def _wait_for_sim_ready(self, timeout_sec):
         """Wait until simulation clock and cmd_vel subscriber are ready."""
@@ -289,6 +400,9 @@ class WorldMapper(Node):
                 clock_ready = True
 
             cmd_ready = self._cmd_pub.get_subscription_count() > 0
+            if clock_ready and not cmd_ready and time.monotonic() - start_time >= 3.0:
+                self.get_logger().warn('Simulation clock ready, but cmd_vel subscriber was not discovered yet. Continuing startup.')
+                return
             if clock_ready and cmd_ready:
                 self.get_logger().info('Simulation ready. Node ready for activation service.')
                 return
@@ -303,11 +417,87 @@ class WorldMapper(Node):
         twist_msg.linear.x = linear_vel
         twist_msg.angular.z = angular_vel
         self._cmd_pub.publish(twist_msg)
+        if (abs(linear_vel) > 0.0 or abs(angular_vel) > 0.0) and time.monotonic() >= self.next_motion_log_wall_time:
+            self.get_logger().info(f"cmd_vel publishing: linear={linear_vel:.2f}, angular={angular_vel:.2f}")
+            self.next_motion_log_wall_time = time.monotonic() + 1.0
 
     def stop(self):
         """Stop the robot."""
         twist_msg = Twist()
         self._cmd_pub.publish(twist_msg)
+
+    def begin_escape_recovery(self, reason, turn_direction=1.0, linear_velocity=ESCAPE_BACKUP_VELOCITY):
+        """Start a small physical escape before asking for another planner path."""
+        escape_word = "backing up" if linear_velocity < 0.0 else "nudging forward"
+        self.get_logger().info(f"{reason}; {escape_word} before replanning")
+        self.stop()
+        self._local_fsm = local_fsm.IDLE
+        self.busy = False
+        self.nav_path = None
+        self.recovery_path = None
+        self._fsm = fsm.RECOVERY
+        self._recovery_fsm = recovery_fsm.ESCAPING
+        self.escape_stage = "backing"
+        self.escape_turn_direction = 1.0 if turn_direction >= 0 else -1.0
+        self.escape_linear_velocity = linear_velocity
+        self.motion_watchdog_pose = None
+        self.escape_done_wall_time = time.monotonic() + ESCAPE_BACKUP_TIME
+        self.done_time_for_laser_wait = self.get_clock().now() + Duration(seconds=LASER_SLEEP_TIME_AFTER_INTERRUPT)
+
+    def run_escape_recovery(self):
+        """Run backup-turn recovery until the robot is ready for a new planner path."""
+        wall_now = time.monotonic()
+        if self.escape_stage == "backing":
+            self.move(self.escape_linear_velocity, 0.0)
+            if wall_now >= self.escape_done_wall_time:
+                self.escape_stage = "turning"
+                self.escape_done_wall_time = wall_now + ESCAPE_TURN_TIME
+            return True
+
+        if self.escape_stage == "turning":
+            self.move(0.0, self.escape_turn_direction * ESCAPE_TURN_VELOCITY)
+            if wall_now >= self.escape_done_wall_time:
+                #  recovery finishing: now ask the global planner for a cleaner route.
+                self.stop()
+                self.escape_stage = None
+                self._recovery_fsm = recovery_fsm.FINE
+                self._fsm = fsm.WAITING_FOR_PATH
+                self.next_path_retry_wall_time = wall_now
+                self.request_path(self.id)
+            return True
+
+        self._recovery_fsm = recovery_fsm.FINE
+        return False
+
+    def watch_motion_progress(self):
+        """Start escape recovery if commanded motion is not changing odometry."""
+        if self._local_fsm != local_fsm.MOVING:
+            self.motion_watchdog_pose = None
+            self.motion_watchdog_wall_time = time.monotonic()
+            return False
+
+        x_odom, y_odom, _ = self.get_base_link_pose_in_odom(rclpy.time.Time())
+        current_pose = (x_odom, y_odom)
+        wall_now = time.monotonic()
+        if self.motion_watchdog_pose is None:
+            self.motion_watchdog_pose = current_pose
+            self.motion_watchdog_wall_time = wall_now
+            return False
+
+        if self.euclidean_distance(current_pose, self.motion_watchdog_pose) >= STUCK_PROGRESS_EPS:
+            self.motion_watchdog_pose = current_pose
+            self.motion_watchdog_wall_time = wall_now
+            return False
+
+        if wall_now - self.motion_watchdog_wall_time >= STUCK_WATCHDOG_SEC:
+            #  stuck noticing: commanded moving with no odom change means collision or traction loss.
+            self.begin_escape_recovery(
+                "Motion stall detected near obstacle",
+                turn_direction=random.choice([-1.0, 1.0]),
+            )
+            return True
+
+        return False
 
     def _turn_on_off_callback(self, req, resp):
         if not req.data: # if the request is false (ie. turn off)
@@ -329,9 +519,10 @@ class WorldMapper(Node):
     
     def start(self):
         """Wait for startup readiness and begin timer-driven control loop."""
-        self._wait_for_sim_ready(STARTUP_TIMEOUT)
-        self._control_timer = self.create_timer(1.0 / FREQUENCY, self._control_loop_callback)
         self._fsm = fsm.WAITING_FOR_PATH
+        self._wait_for_sim_ready(STARTUP_TIMEOUT)
+        #  clock decoupling: robot control should still tick when Gazebo /clock is late.
+        self._control_timer = self.create_timer(1.0 / FREQUENCY, self._control_loop_callback, clock=Clock(clock_type=ClockType.STEADY_TIME))
         
 
 
@@ -345,52 +536,101 @@ class WorldMapper(Node):
 
     def check_TF_buffer_has_data(self, timestamp):
         """returns True if TF buffer has data, false if empty"""
-        if self._tf_buffer.can_transform(
-            'rosbot/odom',         # The reference frame we are converting to (target)
-            'rosbot/base_link',    # The reference frame we are converting from (source)
+        base_ready = self._tf_buffer.can_transform(
+            self.odom_frame,         # The reference frame we are converting to (target)
+            self.base_frame,         # The reference frame we are converting from (source)
             timestamp
-        ):
-            return True
-        else:
-            return False
+        )
+        laser_ready = self._tf_buffer.can_transform(
+            self.odom_frame,
+            self.laser_frame,
+            timestamp
+        )
+        return base_ready and laser_ready
 
     def _nav_path_callback(self, msg):
         """callback function that updates the locally stored nav_path with the pose array published to this topic"""
+        if self.done:
+            #  mission holding: after final answer, old path rebroadcasts should not wake the robot.
+            return
+
         # turning the pose array into an array of (x_odom, y_odom) points
         new_nav_path = []
         for pose in msg.poses:
             new_nav_path.append((pose.position.x, pose.position.y))
 
         # updating local nav_path with the new one
-        self.nav_path = self.clip_nav_path(new_nav_path)
+        if len(new_nav_path) == 0:
+            # Empty path meaning: planner found where we already are, so ask again instead of sitting still.
+            self.nav_path = None
+            self.awaiting_nav_path_after_success = True
+            self.next_path_retry_time = self.get_clock().now() + Duration(seconds=0.5)
+            self.next_path_retry_wall_time = time.monotonic() + 0.5
+            self.get_logger().warn("received empty nav path; requesting another waypoint soon")
+            return
+
+        if (
+            self._fsm == fsm.EXECUTING_PATH
+            and self.last_received_nav_path is not None
+            and self.paths_match(new_nav_path, self.last_received_nav_path)
+        ):
+            #  duplicate path ignoring: coordinator rebroadcasts for reliability, but execution should keep going.
+            return
+
+        clipped_nav_path = self.clip_nav_path(new_nav_path)
+        if len(clipped_nav_path) == 0:
+            self.nav_path = None
+            self.awaiting_nav_path_after_success = True
+            self.next_path_retry_time = self.get_clock().now() + Duration(seconds=0.5)
+            self.next_path_retry_wall_time = time.monotonic() + 0.5
+            self.get_logger().warn("received nav path clipped to nothing; requesting another waypoint soon")
+            return
+
+        self.nav_path = clipped_nav_path
+        self.last_received_nav_path = list(new_nav_path)
+        self.awaiting_nav_path_after_success = False
+        self.busy = False
+        self.done = False
+        self._local_fsm = local_fsm.IDLE
         self.last_nav_path_timestamp = msg.header.stamp
-        #updating fsm
-        if self._fsm == fsm.WAITING_FOR_PATH:
+        self.get_logger().info(f"received nav path with {len(self.nav_path)} waypoint(s)")
+        if self._fsm != fsm.RECOVERY:
             self._fsm = fsm.EXECUTING_PATH
-        elif self._fsm == fsm.RECOVERY:
-            if self._recovery_fsm == recovery_fsm.WAITING_FOR_PATH:
-                # new nav path arrived while waiting for recovery path, now generate recovery path
-                self.get_recovery_path()
-            # if already EXECUTING_PATH, just update nav_path silently for when recovery finishes
+        elif self._recovery_fsm == recovery_fsm.WAITING_FOR_PATH:
+            self.get_recovery_path()
+
+    def paths_match(self, first_path, second_path, tolerance=0.03):
+        """Return true when two odom paths are effectively the same rebroadcast."""
+        if len(first_path) != len(second_path):
+            return False
+
+        for first, second in zip(first_path, second_path):
+            if self.euclidean_distance(first, second) > tolerance:
+                return False
+        return True
 
     def clip_nav_path(self, nav_path):
-        """returns the nav path, but clipped to start at the node closest to the robot's current posisition so it doesn't have to turn around"""
-        # get robot's odom position (most recent)
-        x, y, theta = self.get_base_link_pose_in_odom(rclpy.time.Time())
-        robot_pos = (x,y)
+        """Return the path from the waypoint nearest the robot onward."""
+        if len(nav_path) == 0:
+            return []
 
-        nav_path_copy = nav_path[::] # make a copy of the nav path list passed in
-        best_point = nav_path_copy[0]
-        best_distance = self.euclidean_distance(best_point, robot_pos)
-        for point in nav_path_copy:
-            distance =  self.euclidean_distance(point, robot_pos)
+        try:
+            x, y, _theta = self.get_base_link_pose_in_odom(rclpy.time.Time())
+        except Exception as exc:
+            self.get_logger().warn(f"could not clip nav path without robot pose: {exc}")
+            return nav_path
+
+        robot_pos = (x, y)
+        best_index = 0
+        best_distance = self.euclidean_distance(nav_path[0], robot_pos)
+        for idx, point in enumerate(nav_path):
+            distance = self.euclidean_distance(point, robot_pos)
             if distance <= best_distance:
-                best_distance = distance 
-                best_point = point
-        
-        start_idx = nav_path_copy.index(best_point)
-        nav_path_copy = nav_path_copy[start_idx:]
-        return nav_path_copy
+                best_distance = distance
+                best_index = idx
+
+        return nav_path[best_index:]
+
 
 
     def _laser_callback(self, msg):
@@ -426,23 +666,29 @@ class WorldMapper(Node):
             self.update_SLAM_map(timestamp, angle, msg.ranges[i], msg.range_max) # calling our update slam map function for each laser ray
         
         # SLAM map has been updated, now we check if we are too close to an obstacle and need to find a new path
-        if (self.get_clock().now() > self.done_time_for_laser_wait) and self._recovery_fsm != recovery_fsm.WAITING_FOR_PATH:
-            for ray_length in msg.ranges:
-                if ray_length <= self.PROTECTION_RADIUS: 
-                    self.get_logger().info("Found a point within protection radius, stopping and entering recovery state...")
-                    self.stop()
-                    self._local_fsm = local_fsm.IDLE
-                    self.busy = False
-                    self._fsm = fsm.RECOVERY
-                    self.request_path(self.id) # request a new nav path from the coordinator
-                    if not self._recovery_fsm == recovery_fsm.EXECUTING_PATH:
-                        self._recovery_fsm = recovery_fsm.EXECUTING_PATH
-                        self.get_recovery_path()
-                        
-                        duration = Duration(seconds=LASER_SLEEP_TIME_AFTER_INTERRUPT)
-                        self.done_time_for_laser_wait = self.get_clock().now() + duration
-                        break
-
+        if (
+            self.get_clock().now() > self.done_time_for_laser_wait
+            and not self.waiting_for_path_request
+            and self._recovery_fsm not in (recovery_fsm.EXECUTING_PATH, recovery_fsm.ESCAPING)
+        ):
+            for i, ray_length in enumerate(msg.ranges):
+                if math.isnan(ray_length) or math.isinf(ray_length):
+                    continue
+                angle = msg.angle_min + i * msg.angle_increment
+                forward_hit = abs(angle) <= FORWARD_PROTECTION_ANGLE_RAD and ray_length <= self.PROTECTION_RADIUS
+                emergency_hit = ray_length <= EMERGENCY_PROTECTION_RADIUS
+                if forward_hit or emergency_hit:
+                    escape_linear_velocity = ESCAPE_BACKUP_VELOCITY
+                    if emergency_hit and not forward_hit and abs(angle) > math.pi / 2:
+                        #  rear bump handling: backing up would press harder into the thing behind us.
+                        escape_linear_velocity = ESCAPE_FORWARD_VELOCITY
+                    turn_direction = -1.0 if angle > 0 else 1.0
+                    self.begin_escape_recovery(
+                        "Found a point within protection radius",
+                        turn_direction=turn_direction,
+                        linear_velocity=escape_linear_velocity,
+                    )
+                    break
         # now that our slam map is updated, we publish it (publish includes a header creation)
         self.publish_SLAM_map(timestamp)
     
@@ -592,7 +838,7 @@ class WorldMapper(Node):
         
     def log_odds_to_occupancy(self, log_odds_map):
         """updates returns a occupancy grid from -1 to 100 values given log odds grid"""
-        clamped = np.clip(log_odds_map, -10, 10)  # prevents exp overflow
+        clamped = np.clip(log_odds_map, -10, 10)  # overflow prevention
         probability = 1.0 - 1.0 / (1.0 + np.exp(clamped))
         occupancy = (probability * 100).astype(np.int8)
         occupancy[np.abs(log_odds_map) < 0.01] = -1
@@ -602,7 +848,7 @@ class WorldMapper(Node):
         """This function publishes the current slam map """
         msg = OccupancyGrid() #creating the occupancyGrid message --the data from the occupancy grid: https://docs.ros.org/en/noetic/api/nav_msgs/html/msg/OccupancyGrid.html
 
-        msg.header.frame_id = 'rosbot/odom' # tells rviz which frame this map belongs to - TODO: not sure if this is right
+        msg.header.frame_id = self.map_frame
         msg.header.stamp = self.get_clock().now().to_msg() # timestamp assigned to the slam map
 
         self.SLAM_map_info = self.create_SLAM_map_info() # creating the slam map info we wwant
@@ -619,205 +865,170 @@ class WorldMapper(Node):
         # Afer pulishing the slam map, we know that it has data in it, so mark flag booelan true
         if not self.SLAM_map_populated:
             self.SLAM_map_populated = True
-            # get our first goal point on the frontier
-            self.get_logger().info(f"robot_{self.id} querying path for first time...")
-            self.request_path(self.id) # callback function will handle path assignement locally
+            #  planner starting: the control timer owns requests, so startup mapping cannot trap us.
+            self.next_path_retry_time = self.get_clock().now()
+            self.next_path_retry_wall_time = time.monotonic()
 
 
     def get_recovery_path(self):
-        """sets a recovery path from the robots current location to the closest valid location along the nav path"""
+        """Build a local recovery path back onto the newest planner path."""
         self._recovery_fsm = recovery_fsm.WAITING_FOR_PATH
-        
-        if self.nav_path is None:
+        if self.nav_path is None or len(self.nav_path) == 0:
             return
 
-        # first get the map 
-        SLAM_occupancy = self.log_odds_to_occupancy(self.SLAM_map)
-        smoothed_SLAM_map = self.gaussianSmoothing(SLAM_occupancy, SMOOTHING_KERNEL_SIZE, SMOOTHING_SIGMA)
-        inflated_SLAM_map = self.obstacle_inflation(SLAM_occupancy, PROTECTION_RADIUS, self.SLAM_map_res_m_per_cell)
+        if self.PROBABILISTIC_MAPPING:
+            slam_occupancy = self.log_odds_to_occupancy(self.SLAM_map)
+        else:
+            slam_occupancy = self.SLAM_map
 
-        obstacle_avoidance_search_map = np.zeros_like(SLAM_occupancy, dtype=np.float32)
+        smoothed_SLAM_map = self.gaussianSmoothing(slam_occupancy, SMOOTHING_KERNEL_SIZE, SMOOTHING_SIGMA)
+        inflated_SLAM_map = self.obstacle_inflation(slam_occupancy, PROTECTION_RADIUS, self.SLAM_map_res_m_per_cell)
 
-        obstacle_avoidance_search_map[SLAM_occupancy == -1] = -1  # Unknown remains unknown
-        obstacle_avoidance_search_map[inflated_SLAM_map == 100] = 100 # Inflated obstacles are blocked
-        
-        free_cells = (SLAM_occupancy != -1) & (inflated_SLAM_map != 100) #  free known cells get Gaussian cost
+        obstacle_avoidance_search_map = np.zeros_like(slam_occupancy, dtype=np.float32)
+        obstacle_avoidance_search_map[slam_occupancy == -1] = -1
+        obstacle_avoidance_search_map[inflated_SLAM_map == 100] = 100
+
+        free_cells = (slam_occupancy != -1) & (inflated_SLAM_map != 100)
         obstacle_avoidance_search_map[free_cells] = smoothed_SLAM_map[free_cells]
 
-        # get the robot position in the map
-        x_odom, y_odom, theta_odom = self.get_base_link_pose_in_odom(rclpy.time.Time())
-        robot_cell = self.odom_to_cell((x_odom,y_odom))
+        x_odom, y_odom, _ = self.get_base_link_pose_in_odom(rclpy.time.Time())
+        robot_cell = self.odom_to_cell((x_odom, y_odom))
+        robot_cell = self.get_nearest_free_cell(robot_cell[0], robot_cell[1], obstacle_avoidance_search_map)
 
-        # now get the goal point out of nav path points converted into cells
-        nav_path_reverse = self.nav_path[::-1]
-        nav_path_reverse = [self.odom_to_cell(pt) for pt in nav_path_reverse] # convert all to cells
-        best_point = nav_path_reverse[0]
-        best_distance = self.euclidean_distance(best_point, robot_cell)
-        for point in nav_path_reverse:
-            if 0<=obstacle_avoidance_search_map[point[1]][point[0]] < MAP_CLEAR_THRESHOLD: # if point is valid
-               distance = self.euclidean_distance(point, robot_cell)
-               if distance < best_distance:
-                   best_point = point
-                   best_distance = distance
-                 
-        # now we need to get the path from the current location to the best point on the nav path 
+        #  Recovery choosing: meet the planned route at the nearest valid point.
+        nav_path_reverse = [self.odom_to_cell(pt) for pt in self.nav_path[::-1]]
+        valid_points = [
+            pt for pt in nav_path_reverse
+            if 0 <= pt[0] < self.SLAM_MAP_SIZE_X
+            and 0 <= pt[1] < self.SLAM_MAP_SIZE_Y
+            and 0 <= obstacle_avoidance_search_map[pt[1]][pt[0]] < MAP_CLEAR_THRESHOLD
+        ]
+        if len(valid_points) == 0:
+            self.get_logger().warn("No valid recovery join point on the current nav path")
+            self.recovery_path = []
+            self._recovery_fsm = recovery_fsm.EXECUTING_PATH
+            return
+
+        best_point = min(valid_points, key=lambda pt: self.euclidean_distance(pt, robot_cell))
         path_cells = self.a_star_path(robot_cell, best_point, obstacle_avoidance_search_map, self.SLAM_MAP_SIZE_X, self.SLAM_MAP_SIZE_Y)
-        
-        recovery_path = []
-        if not path_cells is None:
-            for point in path_cells:
-                recovery_path.append(self.cell_to_world(point))
 
-        self.recovery_path = recovery_path
+        self.recovery_path = []
+        if path_cells is not None:
+            self.recovery_path = [self.cell_to_world(point) for point in path_cells]
         self._recovery_fsm = recovery_fsm.EXECUTING_PATH
 
     def a_star_path(self, start_point, goal_point, obstacle_avoidance_search_map, map_width, map_height):
-        """preforms A* and retuns the path (in cell coordinates) from start to goal (excluding the start) """
-        # list of relative neighbors to a node
-        neighbor_list = NEIGHBOR_LIST
-        seen_cells = np.zeros((map_height, map_width), dtype=bool) # I'll be using a 2D array to keep track of seen cells: True=visited; False=unvisited
-        priority_queue = [] #creating a priority queue
-        counter = 0 # a counter to break ties in the prioirty queue, this will make nodes added later be weighted towards the end
-        seen_cells[start_point[1]][start_point[0]] = True # marking the start point as visited
-        # creating a root node at the start point
+        """Run A* and return cell coordinates from start to goal."""
+        seen_cells = np.zeros((map_height, map_width), dtype=bool)
+        priority_queue = []
+        counter = 0
+        seen_cells[start_point[1]][start_point[0]] = True
+
         root_node = TreeNode("root")
-        root_node.x=start_point[0] 
-        root_node.y=start_point[1]
-        root_node.cost=0 
-        
-        goal_node=None
-        heapq.heappush(priority_queue, (self.euclidean_distance(start_point, goal_point), counter, root_node)) # adding, root_node our start point to the priority_queue
-        
-        self.a_star_count = 0
+        root_node.x = start_point[0]
+        root_node.y = start_point[1]
+        root_node.cost = 0
+
+        goal_node = None
+        heapq.heappush(priority_queue, (self.euclidean_distance(start_point, goal_point), counter, root_node))
+
         while len(priority_queue) != 0:
-            self.a_star_count+=1
             _, _, nextup = heapq.heappop(priority_queue)
-
-            # checking if the next cell is the goal
-            if nextup.y == goal_point[1] and nextup.x == goal_point[0]: # if we've found the goal point
-                goal_node = nextup 
+            if nextup.y == goal_point[1] and nextup.x == goal_point[0]:
+                goal_node = nextup
                 break
-            #going through all the points neighboring the nextup
-            for neighbor in neighbor_list:
-                x_n, y_n = neighbor[0]+nextup.x, neighbor[1]+nextup.y # getting neighbor point coordinates
-                if (0<=x_n<map_width and 0<=y_n<map_height) and 0<=obstacle_avoidance_search_map[y_n][x_n]<=MAP_CLEAR_THRESHOLD: # if the neighbor point is valid & unoccupied
-                    
-                    if not seen_cells[y_n][x_n]: # if the neighbor isn't already visited 
-                        # creating a neighbor node to add to the graph as child of nextup
+
+            for neighbor in NEIGHBOR_LIST:
+                x_n, y_n = neighbor[0] + nextup.x, neighbor[1] + nextup.y
+                if (0 <= x_n < map_width and 0 <= y_n < map_height) and 0 <= obstacle_avoidance_search_map[y_n][x_n] <= MAP_CLEAR_THRESHOLD:
+                    if not seen_cells[y_n][x_n]:
                         neighbor_node = TreeNode("child")
-                        neighbor_node.parent=nextup
-                        neighbor_node.x=x_n
-                        neighbor_node.y=y_n
-                        neighbor_node.cost=nextup.cost+self.euclidean_distance((nextup.x, nextup.y), (x_n, y_n)) 
+                        neighbor_node.parent = nextup
+                        neighbor_node.x = x_n
+                        neighbor_node.y = y_n
+                        neighbor_node.cost = nextup.cost + self.euclidean_distance((nextup.x, nextup.y), (x_n, y_n))
 
-                        #assigning the prioirty queue weight of the node we're about to add
-                        weight = neighbor_node.cost + obstacle_avoidance_search_map[y_n][x_n] + self.euclidean_distance((x_n,y_n), goal_point) # weigth is cost from the smoothed map plus euclidean distance
-    
+                        weight = neighbor_node.cost + obstacle_avoidance_search_map[y_n][x_n] + self.euclidean_distance((x_n, y_n), goal_point)
                         heapq.heappush(priority_queue, (weight, counter, neighbor_node))
-                        counter +=1
-                        seen_cells[y_n][x_n] = True # mark as visited
-                        
+                        counter += 1
+                        seen_cells[y_n][x_n] = True
 
-        if goal_node is None: # if we coudn't find the goal node
-            self.get_logger().warn("A* search not able to find a reachable goal; all frontiers explored")
-            return(None)
-        
-        else:# if found, we can backtrack from the goal node to the start to get the path
-            a_star_node_path = [goal_node]
-            while True:
-                if a_star_node_path[0].name == "root": # break before we add the root node, which is the start point, the point the robot is already on
-                    break
-                a_star_node_path.insert(0, a_star_node_path[0].parent)
-                
-            a_star_path = [(n.x,n.y) for n in a_star_node_path] # we want a list of just the point values
-            return a_star_path
-    
-    def gaussianSmoothing(self, to_smooth_array, kernel_size, sigma):
-        """This will apply gaussian smoothing to the inputted 2D array and return smoothed array as output"""
-        
-        if to_smooth_array is None: # have to call this after occupancy grid is called
+        if goal_node is None:
+            self.get_logger().warn("A* search not able to find a reachable recovery goal")
             return None
-        
+
+        a_star_node_path = [goal_node]
+        while a_star_node_path[0].name != "root":
+            a_star_node_path.insert(0, a_star_node_path[0].parent)
+        return [(n.x, n.y) for n in a_star_node_path]
+
+    def gaussianSmoothing(self, to_smooth_array, kernel_size, sigma):
+        """Apply Gaussian smoothing to an occupancy grid."""
+        if to_smooth_array is None:
+            return None
+
         height = to_smooth_array.shape[0]
         width = to_smooth_array.shape[1]
 
-        # constructing the kernel from the gaussian blur formula https://en.wikipedia.org/wiki/Gaussian_blur
         kernel = []
-        for y in range(-kernel_size//2, kernel_size//2 +1):
+        for y in range(-kernel_size//2, kernel_size//2 + 1):
             row = []
-            for x in range(-kernel_size//2, kernel_size//2 +1):
-                row.append(1/(2*math.pi*sigma**2) * math.exp(-1*(x**2 +y**2)/(2*sigma**2)))
+            for x in range(-kernel_size//2, kernel_size//2 + 1):
+                row.append(1/(2*math.pi*sigma**2) * math.exp(-1*(x**2 + y**2)/(2*sigma**2)))
             kernel.append(row)
-        
-        kernel = np.array(kernel) # convert to np array
+
+        kernel = np.array(kernel)
         kernel = kernel / np.sum(kernel)
-        
-        self.smoothedMap = np.zeros((height, width), dtype=np.float32)
-        # now we apply the kernel to the occupancy grid to 
+
+        smoothed_map = np.zeros((height, width), dtype=np.float32)
         for y in range(0, height):
             for x in range(0, width):
-                # for each point in the occupancy grid, we need the kernel_size x kernel_size grid aroudn that sqaure
                 neighborhood = []
-                for y_n in range(-kernel_size//2, kernel_size//2 +1):
+                for y_n in range(-kernel_size//2, kernel_size//2 + 1):
                     neighborhood_row = []
-                    for x_n in range(-kernel_size//2, kernel_size//2+ 1):
-                        if (0<=y+y_n and y+y_n <height and 0<=x+x_n and x+x_n <width):
-                            if (to_smooth_array[y+y_n][x+x_n] >=0 ):
-                                neighborhood_row.append(to_smooth_array[y+y_n][x+x_n])
+                    for x_n in range(-kernel_size//2, kernel_size//2 + 1):
+                        if 0 <= y + y_n < height and 0 <= x + x_n < width:
+                            if to_smooth_array[y + y_n][x + x_n] >= 0:
+                                neighborhood_row.append(to_smooth_array[y + y_n][x + x_n])
                             else:
                                 neighborhood_row.append(0)
                         else:
                             neighborhood_row.append(0)
                     neighborhood.append(neighborhood_row)
+                smoothed_map[y, x] = np.sum(np.array(neighborhood, dtype=np.float32) * kernel)
 
-                # Element-wise multiply and sum
-                neighborhood = np.array(neighborhood, dtype=np.float32)
-                self.smoothedMap[y, x] = np.sum(neighborhood * kernel) # updating the smoothed map
-        
-        # with large sigma, the threshold values for the walls get dimmed way down, so we have to recale
-        max_val = np.max(self.smoothedMap) # find teh largest value in the map
-
-        # Scale everything proportionally
+        max_val = np.max(smoothed_map)
         if max_val != 0:
-            scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
+            scaled = (smoothed_map / max_val) * 100
         else:
-            scaled = self.smoothedMap
+            scaled = smoothed_map
 
-        scaled[self.smoothedMap == 0] = 0 # 0 stays as 0
-        self.smoothedMap = scaled.astype(np.int8) # convert to integre
-       
+        scaled[smoothed_map == 0] = 0
+        smoothed_map = scaled.astype(np.int8)
+        for y in range(0, height):
+            for x in range(0, width):
+                if to_smooth_array[y][x] == 100:
+                    smoothed_map[y][x] = 100
+                if to_smooth_array[y][x] == -1:
+                    smoothed_map[y][x] = -1
 
-        self.smoothedMap = self.smoothedMap.astype(np.int8) #cast to make sure we cast to become integers, because OccupancyGrid topic has int8 datatype
-        # now copying over teh hard 100 values from the occupancy grid to make sure sure
-        for y in range(0,height):
-            for x in range(0,width):
-                if to_smooth_array[y][x] ==100:
-                    self.smoothedMap[y][x] = 100
-                if to_smooth_array[y][x] == -1: # we can't smooth over unexplored cells #TODO: we do still include unexplored pixels in the smoothing
-                    self.smoothedMap[y][x] = -1
-                
-        return self.smoothedMap
-  
+        return smoothed_map
+
     def obstacle_inflation(self, to_inflate_map, protection_radius, resolution):
-        """This function returns a map with inflated obstacles so the robot doesn't collide"""
+        """Inflate occupied cells by the robot protection radius."""
         if to_inflate_map is None:
             return None
 
         inflated = np.copy(to_inflate_map)
         height, width = to_inflate_map.shape
-
-        # getting the protection radius in cells
         radius_cells = int(protection_radius//resolution + 1)
-        # getting obstacle cells
-        obstacle_cells = np.argwhere(to_inflate_map >=  MAP_OCCUPIED_THRESHOLD)  # rows=y, cols=x
-        # inflating area around obstacle cells
+        obstacle_cells = np.argwhere(to_inflate_map >= MAP_OCCUPIED_THRESHOLD)
         for y, x in obstacle_cells:
             for dy in range(-radius_cells, radius_cells + 1):
                 for dx in range(-radius_cells, radius_cells + 1):
                     if dx*dx + dy*dy <= radius_cells**2:
                         ny = y + dy
                         nx = x + dx
-
                         if 0 <= ny < height and 0 <= nx < width:
                             inflated[ny][nx] = 100
 
@@ -826,21 +1037,23 @@ class WorldMapper(Node):
     def euclidean_distance(self, p1, p2):
         """returns euclidean distance between 2 points (x,y) tuple"""
         return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
-    
 
-    # def get_nearest_free_cell(self, x, y, search_map):
-    #     """Returns nearest free cell to inputted point, searching outward in a spiral"""
-    #     for radius in range(0, search_map.shape[0]):
-    #         for dx in range(-radius, radius+1):
-    #             for dy in range(-radius, radius+1):
-    #                 if abs(dx) != radius and abs(dy) != radius:
-    #                     continue
-    #                 nx, ny = x + dx, y + dy
-    #                 if (0 <= nx < self.SLAM_MAP_SIZE_X and 
-    #                     0 <= ny < self.SLAM_MAP_SIZE_Y and
-    #                     0 <= search_map[ny][nx] <= MAP_CLEAR_THRESHOLD):
-    #                     return nx, ny
-    #     return x, y  
+
+
+
+    def get_nearest_free_cell(self, x, y, search_map):
+        """Returns nearest free cell to inputted point, searching outward in a spiral"""
+        for radius in range(0, search_map.shape[0]):
+            for dx in range(-radius, radius+1):
+                for dy in range(-radius, radius+1):
+                    if abs(dx) != radius and abs(dy) != radius:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if (0 <= nx < self.SLAM_MAP_SIZE_X and
+                        0 <= ny < self.SLAM_MAP_SIZE_Y and
+                        0 <= search_map[ny][nx] <= MAP_CLEAR_THRESHOLD):
+                        return nx, ny
+        return x, y
 
     def cell_to_world(self, cell_point):
         """converts pixel/cell point values to world points, returns in (x,y) tuple form"""
@@ -868,9 +1081,18 @@ class WorldMapper(Node):
 
     def get_base_link_pose_in_odom(self, timestamp):
         """This function returns (x,y,theta) position and rotation of the robot (base_link) in the odom reference frame"""
+        if self.latest_odom_msg is not None:
+            pose = self.latest_odom_msg.pose.pose
+            robot_angle_quat = pose.orientation
+            robot_angle = math.atan2(
+                2 * (robot_angle_quat.w*robot_angle_quat.z + robot_angle_quat.x*robot_angle_quat.y),
+                1 - 2*(robot_angle_quat.y*robot_angle_quat.y + robot_angle_quat.z*robot_angle_quat.z)
+            )
+            return (pose.position.x, pose.position.y, robot_angle)
+
         transform = self._tf_buffer.lookup_transform(
-            'rosbot/odom',         # The reference frame we are converting to (target)
-            'rosbot/base_link',    # The reference frame we are converting from (source)
+            self.odom_frame,       # The reference frame we are converting to (target)
+            self.base_frame,       # The reference frame we are converting from (source)
             timestamp
         )
                 
@@ -891,12 +1113,26 @@ class WorldMapper(Node):
 
     def publish_pose(self, timestamp):
         """This function publishes this robots pose (relative to odom reference frame) to self._pose_pub"""
+        if self.latest_odom_msg is not None:
+            msg = PoseStamped()
+            msg.header.stamp = timestamp.to_msg()
+            msg.header.frame_id = self.map_frame
+            msg.pose = self.latest_odom_msg.pose.pose
+            self._pose_pub.publish(msg)
+            return True
+
         # first getting the pose of the robot relative to odom
-        transform = self._tf_buffer.lookup_transform(
-            'rosbot/odom',         # The reference frame we are converting to (target)
-            'rosbot/base_link',    # The reference frame we are converting from (source)
-            rclpy.time.Time() # this time value is like 0/null so it returns latest availiable transform
-        )
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self.odom_frame,       # The reference frame we are converting to (target)
+                self.base_frame,       # The reference frame we are converting from (source)
+                rclpy.time.Time() # this time value is like 0/null so it returns latest availiable transform
+            )
+        except Exception as exc:
+            if self.pose_warning_count % FREQUENCY == 0:
+                self.get_logger().warn(f"Waiting for robot pose before publishing pose: {exc}")
+            self.pose_warning_count += 1
+            return False
                 
         # current point of robot
         x_pos_odom = transform.transform.translation.x # x coordinate of base link in odom reference frame
@@ -909,20 +1145,21 @@ class WorldMapper(Node):
         msg = PoseStamped()
         # filling in the data
         msg.header.stamp = timestamp.to_msg()
-        msg.header.frame_id = "rosbot/odom" # TODO: not sure if this is the correct frame id
+        msg.header.frame_id = self.map_frame
 
         msg.pose.position.x = x_pos_odom
         msg.pose.position.y = y_pos_odom
         msg.pose.orientation = robot_angle_quat
         #publishing the message
         self._pose_pub.publish(msg)
+        return True
 
 
     def get_laser_point_in_odom(self, timestamp, x, y):
         """This function returns (x,y,theta) position and rotation of the robot (base_link) in the odom reference frame"""
         transform = self._tf_buffer.lookup_transform(
-            'rosbot/odom',         # The reference frame we are converting to (target)
-            'rosbot/laser',    # The reference frame we are converting from (source)
+            self.odom_frame,       # The reference frame we are converting to (target)
+            self.laser_frame,      # The reference frame we are converting from (source)
             timestamp
         )
                 
@@ -951,10 +1188,29 @@ class WorldMapper(Node):
             return
 
         # publish the robot's position
-        self.publish_pose(self.get_clock().now())
+        pose_published = self.publish_pose(self.get_clock().now())
 
+        if (
+            pose_published
+            and self.SLAM_map_populated
+            and self.nav_path is None
+            and not self.waiting_for_path_request
+            and time.monotonic() >= self.next_path_retry_wall_time
+        ):
+            self._fsm = fsm.WAITING_FOR_PATH
+            self.request_path(self.id)
 
         if self._fsm==fsm.WAITING_FOR_PATH : # if robot is waiting for path, we do nothing
+            if (
+                self.awaiting_nav_path_after_success
+                and not self.waiting_for_path_request
+                and time.monotonic() >= self.next_path_retry_wall_time
+            ):
+                #  retrying path delivery: the service answered, but the PoseArray did not land.
+                self.get_logger().warn("nav path message not received after service success; retrying path request")
+                self.next_path_retry_time = self.get_clock().now() + Duration(seconds=1.0)
+                self.next_path_retry_wall_time = time.monotonic() + 1.0
+                self.request_path(self.id)
             return
         
         if self._fsm == fsm.RECOVERY and  self._recovery_fsm == recovery_fsm.WAITING_FOR_PATH:
@@ -964,33 +1220,38 @@ class WorldMapper(Node):
             self.stop() # stop robot
             self._fsm = fsm.OFF # turn off robot
             return
+
+        if self._fsm == fsm.RECOVERY and self._recovery_fsm == recovery_fsm.ESCAPING:
+            if self.run_escape_recovery():
+                return
         
-        if not self.busy and (self.nav_path is not None or self._fsm == fsm.RECOVERY):
-            if self._fsm == fsm.RECOVERY and (self.recovery_path is None or len(self.recovery_path) == 0): # if we are out of points in the recovery path
+
+        if not self.busy and (self.nav_path is not None or self._fsm == fsm.RECOVERY): # if we're not in the middle of an action
+            if self._fsm == fsm.RECOVERY and (self.recovery_path is None or len(self.recovery_path) == 0):
                 self.stop()
                 self._fsm = fsm.WAITING_FOR_PATH
                 self._recovery_fsm = recovery_fsm.FINE
                 self.recovery_path = None
-                # Immediately get a new frontier for normal exploration
+                self._local_fsm = local_fsm.IDLE
                 self.request_path(self.id)
                 return
 
-            if self.nav_path is not None and len(self.nav_path) == 0: # if we are out of points in the desired nav path
+            if self.nav_path is not None and len(self.nav_path) == 0: # if we are out of points in the desired path
                 self.nav_path = None
-                self._fsm = fsm.WAITING_FOR_PATH
+                self._fsm=fsm.WAITING_FOR_PATH
                 self.stop()
                 self._local_fsm = local_fsm.IDLE
-                self.get_logger().info("waypoint reached")
-                # now we get the next path by querying the coordinator
+                self.get_logger().info("waypoint reached; requesting next planner path")
                 self.request_path(self.id)
                 return
 
-            
+
             if self._fsm == fsm.RECOVERY:
                 self.next_point_world = self.recovery_path.pop(0)
             else:
-                # if there are still points in nav map we need to get to that we need to get to
-                self.next_point_world = self.nav_path.pop(0) # get next point we need to visit
+                # path Following: take the next planner point.
+                self.next_point_world = self.nav_path.pop(0)
+
 
             current_point_x, current_point_y, robot_angle = self.get_base_link_pose_in_odom(rclpy.time.Time())
 
@@ -1000,17 +1261,29 @@ class WorldMapper(Node):
             rotation = desired_angle - robot_angle # our desired angle
             rotation_to_next = (rotation+math.pi) % (2*math.pi) - math.pi # normalizing the angle to between pi and -pi so that we turn the least we have to
             distance_to_next = math.sqrt((self.next_point_world[0]-current_point_x)**2 + (self.next_point_world[1]-current_point_y)**2)
+            if distance_to_next < 0.05:
+                # waypoint skipping: tiny local steps do not show up in Gazebo and can stall the demo visually.
+                self.busy = False
+                self._local_fsm = local_fsm.IDLE
+                return
+
+            self.get_logger().info(
+                f"driving to waypoint ({self.next_point_world[0]:.2f}, {self.next_point_world[1]:.2f}), "
+                f"distance={distance_to_next:.2f} m"
+            )
 
             #figuring out the time the rotation will take
             sleep_time = abs(rotation_to_next/self.ANGULAR_VELOCITY)
             duration = Duration(seconds=sleep_time)
             self.rotation_done_time = self.get_clock().now() + duration # updating the rotation done time
+            self.rotation_done_wall_time = time.monotonic() + sleep_time
             # figuring out the time the translation will take
             sleep_time = distance_to_next/self.LINEAR_VELOCITY
             duration = Duration(seconds=sleep_time)
             self.translation_done_time = self.rotation_done_time + duration # updating the translation done time (will be executed after the rotation so we must account for that)
+            self.translation_done_wall_time = self.rotation_done_wall_time + sleep_time
 
-            #set fsm to rotating state
+            # local action setting
             self._local_fsm = local_fsm.ROTATING
             #store the angular velocity for the rotation
             self.omega = self.ANGULAR_VELOCITY 
@@ -1022,13 +1295,16 @@ class WorldMapper(Node):
             #if we are busy
             if self._local_fsm == local_fsm.ROTATING: # if we are in rotation state
                 self.move(0.0, self.omega) # send the rotation command
-                if self.get_clock().now() > self.rotation_done_time: # if we are done, update the state to moving (move after a rotation)
+                if time.monotonic() > self.rotation_done_wall_time: # if we are done, update the state to moving (move after a rotation)
                     self._local_fsm=local_fsm.MOVING
 
             if self._local_fsm == local_fsm.MOVING: # if we are in the movement state
+                if self.watch_motion_progress():
+                    return
                 self.move(self.LINEAR_VELOCITY, 0.0) # send the move command
-                if self.get_clock().now() > self.translation_done_time: # if the movement action is done, we are done with this action and we set busy to false
+                if time.monotonic() > self.translation_done_wall_time: # if the movement action is done, we are done with this action and we set busy to false
                     self.busy = False
+                    self.motion_watchdog_pose = None
                     return
 
             
@@ -1090,4 +1366,3 @@ if __name__ == "__main__":
     #     self.move(self.LINEAR_VELOCITY, 0.0)
     #     self.busy = True
     #     return  self.get_clock().now() + duration
-    
