@@ -22,11 +22,13 @@ img_rgb[grid == -1] = [100, 0, 0]
 
 # getting the path points data
 path = r'ros2_ws\src\waypoint_path_data_pa4.npy'
-points = np.load(path)
+# points = np.load(path)
+# img_rgb[199][199] = [0, 0, 200]
+# img_rgb[194][216] = [0, 200, 0]
 
-# set path points to red
-for x, y in points:
-    img_rgb[y, x] = [0, 200, 0]
+# # set path points to red
+# for x, y in points:
+#     img_rgb[y, x] = [0, 200, 0]
 
 img_rgb = np.flipud(img_rgb)
 

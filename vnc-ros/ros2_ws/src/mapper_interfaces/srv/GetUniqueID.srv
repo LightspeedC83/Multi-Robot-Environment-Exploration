@@ -4,6 +4,6 @@
 
 string requester_name
 ---
-uint64 id
+int32 id
 bool success
 string message

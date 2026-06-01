@@ -96,3 +96,31 @@ the coordinator runs 2 services:
 - Type: GetNewFrontierPath, Name: `'get_path'`
 
 
+# Todo:
+- probably offload recovery path calculations to the coordinator
+- if A* can't pathfind to the best frontier, we shouldn't just assume we're done, we should try with next best frontier, etc.
+
+
+ans =
+
+   -3.6000
+
+
+ans =
+
+   -4.8000
+
+
+ans =
+
+  -380
+
+
+ans =
+
+    0.5000
+
+% best_z1 =  -3.6000
+% best_z2 =  -4.8000
+% best_p =  -380
+% best_k =    0.5000
