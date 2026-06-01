@@ -1,109 +1,143 @@
-# Multi‑Robot Map Coordination  
+# Multi-Robot Map Coordination
 
-This package provides a **lightweight ROS 2 wrapper** around a pure‑Python map‑fusion library.  
-It lets any number of robots publish their SLAM maps and receives a single global map plus the static transforms needed to work in a common odom frame.
-
-t=0s  robot1 starts mapping
-t=?   robot1 hits 1000 cells  → first alignment attempt (likely fails, robot2 not ready)
-t=5s  timer fires             → alignment attempt
-t=10s timer fires             → alignment attempt
-...
-t=?   robot2 also has data, alignment succeeds
-         → /tf_static updated
-         → /merged_map published
-t=?   robot1 maps 500 more cells → re-alignment attempt → update if successful
-t=?   robot2 maps 500 more cells → re-alignment attempt → update if successful
-
-## FULL FLOW
-
-Mapper Coordinator starts
-     │
-     ▼
-controller starts
-  └── subscribes to /new_robot_id
-  └── robot_states = {}  (empty)
-
-Robot 1 boots, calls get_unique_id service
-     │
-     ▼
-mapper coordinator: assigns ID=1, publishes Int32(1) on /new_robot_id
-     │
-     ▼
-controller receives Int32(1)
-  └── robot_id = 'robot1'
-  └── creates RobotMapState('robot1')
-  └── subscribes to /robot1/map
-
-Robot 2 boots, calls get_unique_id service
-     │
-     ▼
-mapper coordinator: assigns ID=2, publishes Int32(2) on /new_robot_id
-     │
-     ▼
-controller receives Int32(2)
-  └── robot_id = 'robot2'
-  └── creates RobotMapState('robot2')
-  └── subscribes to /robot2/map
-
-Both robots now publishing maps
-     │
-     ▼
-Your node merges maps, publishes /merged_map, broadcasts TF
+A ROS 2 wrapper around a pure-Python map-fusion library. Any number of robots publish their SLAM maps, and this node produces a single globally-merged map plus the static transforms needed to work in a shared odom frame.
 
 ## Files
 
-`controller.py`  a self‑contained NumPy/OpenCV library that aligns two `nav_msgs/OccupancyGrid` maps, scores the alignment, and fuses them into one larger grid. No ROS dependencies, so it can be unit‑tested offline
-`map_coordinator.py` ROS 2 node that (1) subscribes to each robot’s map topic, (2) calls `coordinator.merge_maps()`, (3) publishes the fused map on `/merged_map`, and (4) broadcasts static TFs `odom_<anchor> → odom_<follower>`
+| File | Purpose |
+| --- | --- |
+| `map_coordinator.py` | Pure NumPy/OpenCV library that aligns two `nav_msgs/OccupancyGrid` maps, scores the alignment, and fuses them. No ROS dependencies, so it can be unit-tested offline. |
+| `controller.py` | ROS 2 node that subscribes to each robot's map, calls `map_coordinator.merge_maps()`, publishes the fused map on `/merged_map`, and broadcasts static TFs between robots' odom frames. |
 
-## ROS 2 Interface  
+## How it works
 
-Subscriptions 
-`/<robot_id>/map` (one per robot)  `nav_msgs/msg/OccupancyGrid` Local SLAM map produced by each robot.
-Publications 
-`/merged_map` `nav_msgs/msg/OccupancyGrid` Latest globally fused map (frame = `odom_1`).
-Static TFs
-`odom_<anchor> → odom_<follower>`, `tf2_ros/StaticTransformBroadcaster`  Allows planners/visualisers to transform poses between robot odom frames.
+When the node starts, it knows about zero robots. Robots are added dynamically as the mapper coordinator hands out IDs:
 
-> The node creates a separate subscriber for every robot ID listened to.
+controller starts
+└── subscribes to /new_robot_id
+└── robot_states = {}  (empty)
+Robot 1 boots, calls get_unique_id service
+└── mapper coordinator assigns ID=1, publishes Int32(1) on /new_robot_id
+└── controller receives it
+├── creates RobotMapState('robot1')
+└── subscribes to /robot1/SLAM_map
+Robot 2 boots, same flow → controller subscribes to /robot2/SLAM_map
+Both robots now publish maps
+└── controller merges, publishes /merged_map, broadcasts inter-odom TF
 
+Alignment is attempted in two situations:
+- a robot has discovered 500 new known cells since the last attempt, or
+- every 5 seconds as a periodic fallback.
 
-## Parameters (ROS 2 parameters)
+Robot 1 is always the anchor when present, so the merged map lives in `robot1/odom`.
 
-`confidence_threshold` `0.5` Minimum confidence (0‑1) required for a merge to be accepted. Raise for more conservative fusing. 
-(hard‑coded) `TRANSFORM_RETRY_CELLS` `500` Number of newly‑known cells a robot must discover before it triggers a new alignment attempt. 
-(hard‑coded) `COORDINATION_PERIOD_SEC` `5.0` Seconds between periodic coordination passes when no robot fires a trigger. 
+## ROS 2 Interface
 
-Change the threshold at runtime, e.g.:
+**Subscriptions:**
+
+| Topic | Type | Notes |
+| --- | --- | --- |
+| `/new_robot_id` | `std_msgs/Int32` | Triggers dynamic registration of a new robot. |
+| `/<robot_id>/SLAM_map` | `nav_msgs/OccupancyGrid` | One subscription per registered robot. |
+
+**Publications:**
+
+| Topic | Type | Notes |
+| --- | --- | --- |
+| `/merged_map` | `nav_msgs/OccupancyGrid` | Fused global map. Frame: `robot1/odom`. |
+
+**Static TFs:**
+
+`robot<anchor>/odom → robot<follower>/odom`, broadcast via `tf2_ros/StaticTransformBroadcaster` once an alignment is accepted. Lets planners and visualizers transform poses between robot odom frames.
+
+## Parameters
+
+| Name | Default | Description |
+| --- | --- | --- |
+| `confidence_threshold` | `0.5` | Minimum confidence (0–1) for a merge to be accepted. Raise for more conservative fusing. |
+| `TRANSFORM_RETRY_CELLS` | `500` | Newly-known cells a robot must discover before triggering a new alignment attempt. Hard-coded. |
+| `COORDINATION_PERIOD_SEC` | `5.0` | Seconds between periodic coordination passes when no robot fires a trigger. Hard-coded. |
+
+Change the threshold at runtime:
 
 ```bash
 ros2 param set /map_coordinator confidence_threshold 0.7
+```
 
-## Run the Code
+## Running the node
 
-### Step 1: Start the container
-Navigate to the `vnc-ros` folder on your Windows machine and run:
-cmd
-cd path\to\vnc-ros
+### 1. Start the container
+
+From the `vnc-ros` folder on your host machine:
+
+```bash
+cd path/to/vnc-ros
 docker compose up -d
 docker compose exec ros bash
+```
 
+### 2. Source ROS 2 and build
 
-### Step 2: Source ROS 2
 Inside the container:
-bash
-source /opt/ros/humble/setup.bash
 
-### Step 3: Build the package
-bash
+```bash
+source /opt/ros/humble/setup.bash
 cd /root/ros2_ws
 colcon build --packages-select merger
 source install/setup.bash
+```
 
+### 3. Launch
 
-### Step 4: Run the node
-bash
+```bash
 ros2 run merger map_merger_node
+```
 
-
-You should see:
+Expected log output on a clean start:
 [INFO] [map_coordinator]: map_coordinator ready, waiting for robots to register, confidence_threshold=0.5
+
+Once robots register and start publishing maps, you'll see logs like:
+[INFO] [map_coordinator]: New robot registered: robot1, subscribing to /robot1/SLAM_map
+[INFO] [map_coordinator]: align robot1<-robot2: inliers=19, wall_agree=0.81, conf=0.78, success=True
+[INFO] [map_coordinator]: broadcasted static TF robot1/odom <- robot2/odom (tx=-0.143m, ty=0.482m, theta=14.88deg)
+
+## Viewing the merged map in RViz
+
+To watch the coordinator working live, open RViz alongside the simulation and display both robots' maps plus the merged result.
+
+### Launch RViz
+
+In a new terminal inside the container:
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+rviz2
+```
+
+### Configure displays
+
+In the left-hand panel:
+
+- **Fixed Frame** (under "Global Options"): `robot1/odom` — this is the frame the merged map is published in.
+
+Click **Add** at the bottom of the displays panel and add three `Map` displays:
+
+| Display name | Topic | Color scheme |
+| --- | --- | --- |
+| Robot 1 map | `/robot1/SLAM_map` | `map` (default) |
+| Robot 2 map | `/robot2/SLAM_map` | `costmap` (for contrast) |
+| Merged map | `/merged_map` | `raw` |
+
+Drop each map's alpha to ~0.6 to see them all at once.
+
+### What you should see
+
+- **Before alignment succeeds:** robot 1's map appears centered. Robot 2's map appears wherever its odom frame places it. `/merged_map` is empty.
+- **After alignment succeeds:** the merged map appears, covering both explored regions in robot 1's frame. The coordinator log shows `success=True` and the inter-odom TF.
+
+### Troubleshooting
+
+- **Merged map never appears.** Check the coordinator's logs for the `conf=...` value. If it stays below 0.5, the robots haven't observed enough common structure yet. Drive both robots into an overlapping region.
+- **Robot 2's map appears at an odd offset before alignment.** Expected — the two robots' odom frames are independent until the coordinator publishes the static TF.
+- **"Fixed Frame doesn't exist" error in RViz.** Robot 1's mapper isn't publishing yet, or the TF tree hasn't reached that frame. Verify with `ros2 topic echo /robot1/SLAM_map` and `ros2 run tf2_tools view_frames`.
