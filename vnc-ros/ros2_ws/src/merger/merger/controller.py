@@ -176,7 +176,8 @@ def build_node():
                 COORDINATION_PERIOD_SEC, self._coordination_pass,
             )
 
-            self.get_logger().info(f'map_coordinator ready, waiting for robots to register, 'f'confidence_threshold={self.confidence_threshold}')
+            self.get_logger().info(f'map_coordinator ready, waiting for robots to register, '
+                                   f'confidence_threshold={self.confidence_threshold}')
 
         # Subscribers
         def _on_new_robot_registered(self, msg: Int32):
