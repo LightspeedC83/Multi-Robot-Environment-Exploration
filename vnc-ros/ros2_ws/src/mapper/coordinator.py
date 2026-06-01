@@ -86,7 +86,7 @@ class Coordinator(Node):
 
         ## setting up unique ID service ##
         self.srv = self.create_service(GetUniqueID, 'get_unique_id', self.handle_id_request)
-        self.global_id = 0  # define a global ID tracker
+        self.global_id = 0  # define a global ID tracker (current global id is the most recent id assigned)
     
     def handle_id_request(self, request, response):
         """This is the callback function to handle the server side of the GetUniqueID service"""
@@ -155,7 +155,15 @@ class Coordinator(Node):
 
     def _id_active_callback(self, msg:Bool, robot_id):
         """updates the ids_active dictionary with this robot id and status"""
+        # update the ids_active dictionary
         self.ids_active[robot_id] = msg.data
+        # update the number of active robots
+        num_active_robots = 0
+        for id in self.ids_active.keys():
+            if self.ids_active[id]:
+                num_active_robots+=1
+        self.num_active_robots = num_active_robots
+        
 
     def unpack_map_msg(self, map_msg):
         """ returns a occupancy grid (2D array), resolution, x_occupancy_grid_origin, y_occupancy_grid_origin, origin_rotation, map_width, map_height, timestamp """
@@ -509,7 +517,7 @@ class Coordinator(Node):
     def _control_loop_callback(self): # will be called every self.delta_t seconds 
         if self.num_active_robots <= 0: # if no active robots we do nothing
             return
-        for id in range(self.num_active_robots): # for all ids we've assigned
+        for id in range(self.global_id+1): # for all ids we've assigned
             if self.ids_active[id]: # if this id is active
                 self.single_robot_plan(id)
             
