@@ -94,3 +94,5 @@ When `PROBABILISTIC_MAPPING` is False, the robot operates in normal mode, as out
 the coordinator runs 2 services:
 - Type: GetUniqueID, Name: `'get_unique_id'`
 - Type: GetNewFrontierPath, Name: `'get_path'`
+
+
