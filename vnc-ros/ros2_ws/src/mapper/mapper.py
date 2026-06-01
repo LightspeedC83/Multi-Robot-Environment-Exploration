@@ -362,7 +362,7 @@ class WorldMapper(Node):
             new_nav_path.append((pose.position.x, pose.position.y))
 
         # updating local nav_path with the new one
-        self.nav_path = new_nav_path
+        self.nav_path = self.clip_nav_path(new_nav_path)
         self.last_nav_path_timestamp = msg.header.stamp
         #updating fsm
         if self._fsm == fsm.WAITING_FOR_PATH:
@@ -372,6 +372,25 @@ class WorldMapper(Node):
                 # new nav path arrived while waiting for recovery path, now generate recovery path
                 self.get_recovery_path()
             # if already EXECUTING_PATH, just update nav_path silently for when recovery finishes
+
+    def clip_nav_path(self, nav_path):
+        """returns the nav path, but clipped to start at the node closest to the robot's current posisition so it doesn't have to turn around"""
+        # get robot's odom position (most recent)
+        x, y, theta = self.get_base_link_pose_in_odom(rclpy.time.Time())
+        robot_pos = (x,y)
+
+        nav_path_copy = nav_path[::] # make a copy of the nav path list passed in
+        best_point = nav_path_copy[0]
+        best_distance = self.euclidean_distance(best_point, robot_pos)
+        for point in nav_path_copy:
+            distance =  self.euclidean_distance(point, robot_pos)
+            if distance <= best_distance:
+                best_distance = distance 
+                best_point = point
+        
+        start_idx = nav_path_copy.index(best_point)
+        nav_path_copy = nav_path_copy[start_idx:]
+        return nav_path_copy
 
 
     def _laser_callback(self, msg):

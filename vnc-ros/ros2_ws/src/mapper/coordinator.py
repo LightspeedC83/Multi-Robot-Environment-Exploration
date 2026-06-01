@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #The line above is important so that this file is interpreted with Python when running it.
 
-# Author: Charles Lowney (built on code from my PA3 submission)
+# Author: Charles Lowney (built on code from my PA4 submission)
 # Date: 5/10/26
 
 # This Python Program implements a SLAM in a robot
@@ -14,6 +14,7 @@ import time
 import numpy as np # for map grid representations and operations
 from anytree import Node as TreeNode # for search algorithms (so important to import as Tree node because we have a Node class from ros2 already
 import heapq # for A*
+from collections import deque
 import functools # for partial funciton calling
 
 # import of relevant libraries.
@@ -50,10 +51,16 @@ SMOOTHING_SIGMA = 6 # The standard deviation applied to the gaussian smoothing a
 
 MAP_CLEAR_THRESHOLD = 33 # program treats any value below this as free space
 MAP_OCCUPIED_THRESHOLD = 80 # program treats any value above this as occupied and to be avoided
+
+CLUSTER_CELL_RADIUS = 5  # radius in cells to group frontier cells into clusters
+FRONTIER_RAYCAST_WEIGHT = 0.5  # weight for unknown cells visible in score equation
+FRONTIER_RAYCAST_RANGE_CELLS = 30  # max range in cells for raycast simulation
+FRONTIER_RAYCAST_ANGULAR_RESOLUTION = 10  # degrees between rays in raycast simulation
+
 # Topic names
 
 # Frequency at which the loop operates
-FREQUENCY = 100 #Hz.
+FREQUENCY = 5 #Hz.
 
 USE_SIM_TIME = True
 STARTUP_TIMEOUT = 15.0 # s. Max wait for simulator/controller startup.
@@ -91,6 +98,7 @@ class Coordinator(Node):
 
         ## setting up a path generation service ##
         self.path_srv = self.create_service(GetNewFrontierPath, 'get_path', self.handle_path_request)
+        self.current_frontiers = {} # dictionary of id --> frontier cell point to keep track of it
 
         ## setting up new_robot_id topic
         self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id", 1)
@@ -113,6 +121,7 @@ class Coordinator(Node):
         self.num_active_robots +=1
         self.setup_listeners(self.global_id)
         self.setup_publishers(self.global_id)
+        self.current_frontiers[self.global_id] = None
 
         # publishing the new id to the /new_robot_id topic
         new_id_msg = Int32()
@@ -316,7 +325,7 @@ class Coordinator(Node):
         x_map, y_map = self.odom_to_cell(x_robot_odom, y_robot_odom, x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
 
         # find the path to the best frontier point in cell coords
-        path_cell = self.get_frontier_path(map, x_map, y_map, map_width, map_height, grid_res)
+        path_cell = self.get_frontier_path(map, x_map, y_map, map_width, map_height, grid_res, robot_id)
         if path_cell is None: 
             return False
         
@@ -343,7 +352,7 @@ class Coordinator(Node):
         return True
 
 
-    def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell):
+    def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell, robot_id):
         """returns a list of map cell coordinates connecting the pos_map point with the best frontier"""
         self.get_logger().info("starting frontier path generation")
         
@@ -367,7 +376,7 @@ class Coordinator(Node):
         # self.get_logger().info(obstacle_avoidance_search_map)
         np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
-        # start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
+        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
 
         # getting the goal point
         ranked_frontiers = self.rank_frontiers(obstacle_avoidance_search_map, x_pos_map, y_pos_map, map_width, map_height) 
@@ -375,7 +384,8 @@ class Coordinator(Node):
             self.get_logger().warn("No frontiers found")
             return None
         goal_point = ranked_frontiers[0][0] # best frontier (one with lowest score will be first in list, and it's index 0 in the pt,score tuple)
-        self.get_logger().info(f"frontier pt {goal_point} value {obstacle_avoidance_search_map[goal_point[1]][goal_point[0]]}")
+        self.get_logger().info(f"frontier pt: {goal_point}")
+        self.current_frontiers[robot_id] = goal_point # recording the frontier that this robot is actively investigating
         
         # A* to find the best path to the goal frontier point
 
@@ -443,42 +453,110 @@ class Coordinator(Node):
     def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height):
         """returns a list of (frontier_pt, score) sorted in lowest to highest"""
 
-        # do bfs from robot position on the map to get the list of the frontier points
+        # BFS to find all frontier points reachable from robot position
         frontier_points = []
-        seen_cells = np.zeros((map_height, map_width), dtype=bool) # I'll be using a 2D array to keep track of seen cells: True=visited; False=unvisited
-        start_cell = (x_pos_map, y_pos_map)
-        
-        queue = []
-        queue.append(start_cell)
+        seen_cells = np.zeros((map_height, map_width), dtype=bool)
+        queue = deque()
+        queue.append((x_pos_map, y_pos_map))
         seen_cells[y_pos_map][x_pos_map] = True
         while len(queue) > 0:
-            nextup = queue.pop(0)
-            if (self.is_frontier_cell(map, nextup[0], nextup[1], map_width, map_height)):
+            nextup = queue.popleft()
+            if self.is_frontier_cell(map, nextup[0], nextup[1], map_width, map_height):
                 frontier_points.append(nextup)
-            
             for neighbor in NEIGHBOR_LIST:
-                x_n, y_n = neighbor[0]+nextup[0], neighbor[1]+nextup[1] # getting neighbor point coordinates
-                if (0<=x_n<map_width and 0<=y_n<map_height): # if the neighbor point is valid
-                    if not seen_cells[y_n][x_n] and 0<=map[y_n][x_n]<MAP_CLEAR_THRESHOLD: # if point is unseen, explored, & unoccupied
-                        queue.append((x_n, y_n)) # add neighbor to queue
-                        seen_cells[y_n][x_n] = True # mark as visited
-        
-        # now that we have a list of the frontiers, we rank them
-        scored_frontiers = []
+                x_n, y_n = neighbor[0]+nextup[0], neighbor[1]+nextup[1]
+                if (0<=x_n<map_width and 0<=y_n<map_height):
+                    if not seen_cells[y_n][x_n] and 0<=map[y_n][x_n]<MAP_CLEAR_THRESHOLD:
+                        queue.append((x_n, y_n))
+                        seen_cells[y_n][x_n] = True
+
+        # cluster frontier points so we only raycast once per cluster
+        clustered = np.zeros((map_height, map_width), dtype=bool) # tracks which frontier pts have been assigned to a cluster
+        clusters = [] # list of (centroid_x, centroid_y, representative_frontier_pt)
         for pt in frontier_points:
-            score = self.score_frontier(pt, map, x_pos_map, y_pos_map)
-            scored_frontiers.append((pt, score))
-        
-        ranked_frontiers = sorted(scored_frontiers, key=lambda x: x[1]) # sorting the frontiers by the score (lowest to highest)
+            if clustered[pt[1]][pt[0]]:
+                continue # already assigned to a cluster
+            # find all frontier points within CLUSTER_CELL_RADIUS
+            cluster = []
+            for other_pt in frontier_points:
+                if self.euclidean_distance(pt, other_pt) <= CLUSTER_CELL_RADIUS:
+                    cluster.append(other_pt)
+                    clustered[other_pt[1]][other_pt[0]] = True
+            centroid_x = int(round(sum(p[0] for p in cluster) / len(cluster)))
+            centroid_y = int(round(sum(p[1] for p in cluster) / len(cluster)))
+            clusters.append((centroid_x, centroid_y, pt)) # store centroid and representative pt
+
+        # score each cluster with one raycast, assign score to representative frontier pt
+        scored_frontiers = []
+        for centroid_x, centroid_y, representative_pt in clusters:
+            unknown_cells_visible = self.raycast_unknown_cells(centroid_x, centroid_y, map, map_width, map_height)
+            distance_to_robot = self.euclidean_distance(representative_pt, (x_pos_map, y_pos_map))
+            score = distance_to_robot - FRONTIER_RAYCAST_WEIGHT * unknown_cells_visible
+            scored_frontiers.append((representative_pt, score))
+
+        ranked_frontiers = sorted(scored_frontiers, key=lambda x: x[1])
         return ranked_frontiers
 
-    def score_frontier(self, frontier_pt, map, x_cell_robot, y_cell_robot):
-        """Given a frontier point, this function outputs a score for that point"""
-        # score by distance to start
-        distance_to_robot = math.sqrt((frontier_pt[0]-x_cell_robot)**2 + (frontier_pt[1]-y_cell_robot)**2)
+    # def score_frontier(self, frontier_pt, map, x_cell_robot, y_cell_robot):
+    #     """Given a frontier point, this function outputs a score for that point"""
+    #     # score by distance to start
+    #     distance_to_robot = math.sqrt((frontier_pt[0]-x_cell_robot)**2 + (frontier_pt[1]-y_cell_robot)**2)
 
-        score = distance_to_robot
-        return score
+    #     # find all frontier cells within cluster_cell_radius of this point (its cluster)
+    #     cluster_cell_radius = CLUSTER_CELL_RADIUS
+    #     map_height, map_width = map.shape
+        
+    #     cluster = []
+    #     for dx in range(-cluster_cell_radius, cluster_cell_radius + 1):
+    #         for dy in range(-cluster_cell_radius, cluster_cell_radius + 1):
+    #             if dx*dx + dy*dy <= cluster_cell_radius**2:
+    #                 nx, ny = frontier_pt[0] + dx, frontier_pt[1] + dy
+    #                 if (0 <= nx < map_width and 0 <= ny < map_height):
+    #                     if self.is_frontier_cell(map, nx, ny, map_width, map_height):
+    #                         cluster.append((nx, ny))
+
+    #     # use centroid of cluster as the representative point for raycasting
+    #     if len(cluster) > 0:
+    #         centroid_x = int(round(sum(p[0] for p in cluster) / len(cluster)))
+    #         centroid_y = int(round(sum(p[1] for p in cluster) / len(cluster)))
+    #     else:
+    #         centroid_x, centroid_y = frontier_pt[0], frontier_pt[1]
+
+    #     # raycast from centroid to estimate information gain
+    #     unknown_cells_visible = self.raycast_unknown_cells(centroid_x, centroid_y, map, map_width, map_height)
+
+    #     # lower score = better: closer frontiers with more unknown cells visible are preferred
+    #     score = distance_to_robot - FRONTIER_RAYCAST_WEIGHT * unknown_cells_visible
+
+    #     return score
+
+    def raycast_unknown_cells(self, x, y, map, map_width, map_height, cluster_cell_radius=CLUSTER_CELL_RADIUS, raycast_range=FRONTIER_RAYCAST_RANGE_CELLS, angular_resolution=FRONTIER_RAYCAST_ANGULAR_RESOLUTION):
+        """simulates a 360 degree raycast from (x,y) and returns the number of unique unknown (-1) cells visible.
+        rays stop when they hit an occupied cell so cells behind obstacles are not counted."""
+        visible_unknown = set() # using a set so we don't double count cells seen by multiple rays
+
+        for angle_deg in range(0, 360, angular_resolution):
+            angle_rad = math.radians(angle_deg)
+            dx = math.cos(angle_rad)
+            dy = math.sin(angle_rad)
+
+            # step along the ray
+            for step in range(1, raycast_range + 1):
+                rx = int(round(x + dx * step))
+                ry = int(round(y + dy * step))
+
+                if not (0 <= rx < map_width and 0 <= ry < map_height): # if out of bounds stop ray
+                    break
+
+                cell_val = map[ry][rx]
+
+                if cell_val >= MAP_OCCUPIED_THRESHOLD: # if occupied, stop ray (don't count behind obstacle)
+                    break
+                elif cell_val == -1: # if unknown, count it and continue (unknown space doesn't block)
+                    visible_unknown.add((rx, ry))
+
+        return len(visible_unknown)
+
 
     def euclidean_distance(self, p1, p2):
         """returns euclidean distance between 2 points (x,y) tuple"""
@@ -500,7 +578,7 @@ class Coordinator(Node):
 
     def is_frontier_cell(self, map, x, y, map_width, map_height):
         """returns true if the inputted point is free space on SLAM map and next to -1"""
-        if map[y][x] >= MAP_OCCUPIED_THRESHOLD and map[y][x] != -1 :
+        if map[y][x] >= MAP_CLEAR_THRESHOLD and map[y][x] != -1 :
             return False # if occupied or unexplored, not frontier cell...
         
         # list of relative neighbors to a node
@@ -611,7 +689,23 @@ class Coordinator(Node):
         return inflated
 
     def _control_loop_callback(self): # will be called every self.delta_t seconds 
-        pass
+        # checking if the current frontier has been filled in
+        if self.num_active_robots <=0:
+            return
+        
+        for id in range(1,self.global_id+1):
+            if id not in self.ids_active:
+                continue
+            if self.ids_active[id]:
+                frontier_pt = self.current_frontiers[id]
+                if not frontier_pt is None:
+                    # getting map for this robot
+                    map, _, _, _, _, width, height, _ = self.unpack_map_msg(self.map_msgs[id])
+                    if not self.is_frontier_cell(map, frontier_pt[0], frontier_pt[1], width, height): # if it's no longer a fontier point, we need to recalculate path
+                        self.get_logger().info(f"Old Frontier for robot_{id} filled, in searching for new")
+                        self.single_robot_plan(id)
+                        self.current_frontiers[id] = None
+
             
 
 
