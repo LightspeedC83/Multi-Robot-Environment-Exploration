@@ -32,7 +32,6 @@ import numpy as np
 
 from merger import map_coordinator as mc
 
-
 # Constants
 
 DEFAULT_MERGED_MAP_TOPIC   = 'merged_map'
