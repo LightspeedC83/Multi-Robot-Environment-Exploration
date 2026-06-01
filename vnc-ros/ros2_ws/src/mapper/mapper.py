@@ -24,8 +24,10 @@ from geometry_msgs.msg import Twist # message type for cmd_vel
 from sensor_msgs.msg import LaserScan # message type for scan
 from nav_msgs.msg import OccupancyGrid # message type for occupancyGrid
 from  nav_msgs.msg import MapMetaData # for the slam_map msg.info
-from geometry_msgs.msg import Pose, Point, Quaternion # for the ifnromation stored in slam_map msg.info
+from geometry_msgs.msg import Pose, PoseStamped, Point, Quaternion # for the ifnromation stored in slam_map msg.info
 from tf2_ros import TransformListener, Buffer
+
+from std_msgs.msg import Bool # for id_active publisher
 
 from std_srvs.srv import SetBool # service type 
 
@@ -123,7 +125,19 @@ class WorldMapper(Node):
         self._SLAM_map_pub = self.create_publisher(OccupancyGrid, self.map_publish_topic_name, 1)
         
         # setting up a publisher to publish the current position of the robot
-        # TODO: This^^
+        if not self.id is None:
+            self.pose_publish_topic_name = f'/pose_{self.id}'
+        else:
+            self.pose_publish_topic_name = '/pose_NO_ID'  
+
+        self._pose_pub = self.create_publisher(PoseStamped, self.pose_publish_topic_name, 1)
+        
+        # setting up a publisher to publish whether this ID is active
+        self._id_active_pub = self.create_publisher(Bool, f"id_active_{self.id}", 1)
+        
+        id_active_msg = Bool()
+        id_active_msg.data = True
+        self._id_active_pub.publish(id_active_msg) # publishing that this node is active!
 
         # setting up on/off service
         self._on_off_service = self.create_service(SetBool, f'{node_name}/{DEFAULT_SERVICE_NAME}', self._turn_on_off_callback)
@@ -260,7 +274,16 @@ class WorldMapper(Node):
         """Wait for startup readiness and begin timer-driven control loop."""
         self._wait_for_sim_ready(STARTUP_TIMEOUT)
         self._control_timer = self.create_timer(1.0 / FREQUENCY, self._control_loop_callback)
+        
 
+
+    def shutdown_mapper(self):
+        """shuts down the mapper"""
+        # publishing that this node is NOT active!
+        id_active_msg = Bool()
+        id_active_msg.data = False
+        self._id_active_pub.publish(id_active_msg)
+        
 
     def check_TF_buffer_has_data(self, timestamp):
         """returns True if TF buffer has data, false if empty"""
@@ -392,9 +415,6 @@ class WorldMapper(Node):
 
     def update_SLAM_map(self, timestamp, laser_angle, ray_length, range_max): 
         """This function updates the slam map based on a laser ray, it takes in the angle of the ray, the range data from the ray, and the max range of the sensor"""
-        
-        if self.PROBABILISTIC_MAPPING: # implementation of extra credit
-            pass # TODO: proabalistic mapping implementation
 
         # now we get the start and end point of the ray in space
         endpoint_clear = False # if the end point of the laser ray terminates in a wall this is false, if it just terminates at max distance, 
@@ -505,236 +525,241 @@ class WorldMapper(Node):
 
 
 
-    def get_frontier_point(self, timestamp, CLEAR_THRESHOLD):
-        """returns a point (in SLAM map frame) that is on the frontier of the SLAM map
-            returns None if no frontier point able to be found, returns the nearest frontier
-            point (x,y) in SLAM map cell coordinates. updates self.frontier_path with the path"""
-        self.get_logger().info("Getting next point on frontier.")
-        self.computing_frontier_path = True
+    # def get_frontier_point(self, timestamp, CLEAR_THRESHOLD):
+    #     """returns a point (in SLAM map frame) that is on the frontier of the SLAM map
+    #         returns None if no frontier point able to be found, returns the nearest frontier
+    #         point (x,y) in SLAM map cell coordinates. updates self.frontier_path with the path"""
+    #     self.get_logger().info("Getting next point on frontier.")
+    #     self.computing_frontier_path = True
 
-        # getting current location
-        x_pos_odom, y_pos_odom, theta_odom = self.get_base_link_pose_in_odom(timestamp)
-        start_point = self.odom_to_cell((x_pos_odom, y_pos_odom)) 
+    #     # getting current location
+    #     x_pos_odom, y_pos_odom, theta_odom = self.get_base_link_pose_in_odom(timestamp)
+    #     start_point = self.odom_to_cell((x_pos_odom, y_pos_odom)) 
         
         
-        if self.PROBABILISTIC_MAPPING:
-            SLAM_map_to_use = self.log_odds_to_occupancy(self.SLAM_map)
-        else:
-            SLAM_map_to_use = self.SLAM_map
+    #     if self.PROBABILISTIC_MAPPING:
+    #         SLAM_map_to_use = self.log_odds_to_occupancy(self.SLAM_map)
+    #     else:
+    #         SLAM_map_to_use = self.SLAM_map
             
-        # smoothing the SLAM map so that we dont' run into any walls (ie. obstacle inflation)
-        smoothed_SLAM_map = self.gaussianSmoothing(SLAM_map_to_use, self.SMOOTHING_KERNEL_SIZE, self.SMOOTHING_SIGMA)
-        inflated_SLAM_map = self.obstacle_inflation(SLAM_map_to_use, self.PROTECTION_RADIUS, self.SLAM_map_res_m_per_cell)
+    #     # smoothing the SLAM map so that we dont' run into any walls (ie. obstacle inflation)
+    #     smoothed_SLAM_map = self.gaussianSmoothing(SLAM_map_to_use, self.SMOOTHING_KERNEL_SIZE, self.SMOOTHING_SIGMA)
+    #     inflated_SLAM_map = self.obstacle_inflation(SLAM_map_to_use, self.PROTECTION_RADIUS, self.SLAM_map_res_m_per_cell)
 
-        obstacle_avoidance_search_map = np.zeros_like(SLAM_map_to_use, dtype=np.float32)
+    #     obstacle_avoidance_search_map = np.zeros_like(SLAM_map_to_use, dtype=np.float32)
 
-        obstacle_avoidance_search_map[SLAM_map_to_use == -1] = -1  # Unknown remains unknown
-        obstacle_avoidance_search_map[inflated_SLAM_map == 100] = 100 # Inflated obstacles are blocked
+    #     obstacle_avoidance_search_map[SLAM_map_to_use == -1] = -1  # Unknown remains unknown
+    #     obstacle_avoidance_search_map[inflated_SLAM_map == 100] = 100 # Inflated obstacles are blocked
         
-        free_cells = (SLAM_map_to_use != -1) & (inflated_SLAM_map != 100) #  free known cells get Gaussian cost
-        obstacle_avoidance_search_map[free_cells] = smoothed_SLAM_map[free_cells]
+    #     free_cells = (SLAM_map_to_use != -1) & (inflated_SLAM_map != 100) #  free known cells get Gaussian cost
+    #     obstacle_avoidance_search_map[free_cells] = smoothed_SLAM_map[free_cells]
 
-        # self.get_logger().info(obstacle_avoidance_search_map)
-        np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
+    #     # self.get_logger().info(obstacle_avoidance_search_map)
+    #     np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
-        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map) # snap to nearest free space as start point, needed for recovery mode
+    #     start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map) # snap to nearest free space as start point, needed for recovery mode
 
-        # preforming A* to find the nearest frontier point
+    #     # preforming dijkstra to find the nearest frontier point
 
-        # list of relative neighbors to a node
-        neighbor_list = [
-                         (0,1),
-                (-1,0),          (1,0),
-                         (0,-1)
-                ]    
+    #     # list of relative neighbors to a node
+    #     neighbor_list = [
+    #             (-1,1),  (0,1),  (1,1),
+    #             (-1,0),          (1,0),
+    #             (-1,-1), (0,-1), (1,-1)  
+    #             ]    
+    #     # neighbor_list = [
+    #     #                   (0,1),
+    #     #         (-1,0),          (1,0),
+    #     #                 (0,-1),  
+    #     #         ] 
 
-        best_cost = np.full((self.SLAM_MAP_SIZE_Y, self.SLAM_MAP_SIZE_X), np.inf, dtype=np.float32) # dijkstra bookepping
+    #     best_cost = np.full((self.SLAM_MAP_SIZE_Y, self.SLAM_MAP_SIZE_X), np.inf, dtype=np.float32) # dijkstra bookepping
 
-        seen_cells = np.zeros((self.SLAM_MAP_SIZE_Y, self.SLAM_MAP_SIZE_X), dtype=bool) # I'll be using a 2D array to keep track of seen cells: True=visited; False=unvisited
-        priority_queue = [] #creating a priority_queue
+    #     seen_cells = np.zeros((self.SLAM_MAP_SIZE_Y, self.SLAM_MAP_SIZE_X), dtype=bool) # I'll be using a 2D array to keep track of seen cells: True=visited; False=unvisited
+    #     priority_queue = [] #creating a priority_queue
 
-        # creating a root node at the start point
-        root_node = TreeNode("root")
-        root_node.x=start_point[0] 
-        root_node.y=start_point[1]
-        root_node.cost=0 
+    #     # creating a root node at the start point
+    #     root_node = TreeNode("root")
+    #     root_node.x=start_point[0] 
+    #     root_node.y=start_point[1]
+    #     root_node.cost=0 
 
-        goal_node=None
-        best_cost[start_point[1]][start_point[0]] = 0.0
-        counter = 0
-        heapq.heappush(priority_queue, (0.0, counter, root_node)) # adding our start point to the priority_queue
+    #     goal_node=None
+    #     best_cost[start_point[1]][start_point[0]] = 0.0
+    #     counter = 0
+    #     heapq.heappush(priority_queue, (0.0, counter, root_node)) # adding our start point to the priority_queue
         
-        while len(priority_queue) != 0:
+    #     while len(priority_queue) != 0:
 
-            current_cost, _, nextup = heapq.heappop(priority_queue)
-            # If already finalized, skip
-            if seen_cells[nextup.y][nextup.x]:
-                continue
+    #         current_cost, _, nextup = heapq.heappop(priority_queue)
+    #         # If already finalized, skip
+    #         if seen_cells[nextup.y][nextup.x]:
+    #             continue
             
-            seen_cells[nextup.y][nextup.x] = True # we mark as finalized when popped
+    #         seen_cells[nextup.y][nextup.x] = True # we mark as finalized when popped
 
-            # checking if the next cell is the goal
-            if self.is_frontier_cell(SLAM_map_to_use,nextup.x, nextup.y): # if we've found a frontier point
-                goal_node = nextup 
-                break
-            #going through all the points neighboring the nextup
-            for neighbor in neighbor_list:
-                x_n, y_n = neighbor[0]+nextup.x, neighbor[1]+nextup.y # getting neighbor point coordinates
-                if (0<=x_n<self.SLAM_MAP_SIZE_X and 0<=y_n<self.SLAM_MAP_SIZE_Y) and 0<=obstacle_avoidance_search_map[y_n][x_n]<=CELL_PROBABILITY_OCCUPIED: # if the neighbor point is valid & unoccupied
-                    if not seen_cells[y_n][x_n]: # if the neighbor isn't already visited 
-                        # cost to move into this neighbor.
-                        # higher map value = closer to obstacle = more expensive.
-                        step_cost = 1.0 + float(obstacle_avoidance_search_map[y_n][x_n])
+    #         # checking if the next cell is the goal
+    #         if self.is_frontier_cell(SLAM_map_to_use,nextup.x, nextup.y): # if we've found a frontier point
+    #             goal_node = nextup 
+    #             break
+    #         #going through all the points neighboring the nextup
+    #         for neighbor in neighbor_list:
+    #             x_n, y_n = neighbor[0]+nextup.x, neighbor[1]+nextup.y # getting neighbor point coordinates
+    #             if (0<=x_n<self.SLAM_MAP_SIZE_X and 0<=y_n<self.SLAM_MAP_SIZE_Y) and 0<=obstacle_avoidance_search_map[y_n][x_n]<=CELL_PROBABILITY_OCCUPIED: # if the neighbor point is valid & unoccupied
+    #                 if not seen_cells[y_n][x_n]: # if the neighbor isn't already visited 
+    #                     # cost to move into this neighbor.
+    #                     # higher map value = closer to obstacle = more expensive.
+    #                     step_cost = 1.0 + float(obstacle_avoidance_search_map[y_n][x_n])
 
-                        new_cost = current_cost + step_cost
+    #                     new_cost = current_cost + step_cost
                         
-                        if new_cost < best_cost[y_n][x_n]: # dijkstra relaxation
-                            best_cost[y_n][x_n] = new_cost
+    #                     if new_cost < best_cost[y_n][x_n]: # dijkstra relaxation
+    #                         best_cost[y_n][x_n] = new_cost
 
-                            # creating a neighbor node to add to the graph as child of nextup
-                            neighbor_node = TreeNode("child")
-                            neighbor_node.parent=nextup
-                            neighbor_node.x=x_n
-                            neighbor_node.y=y_n
-                            neighbor_node.cost = new_cost
+    #                         # creating a neighbor node to add to the graph as child of nextup
+    #                         neighbor_node = TreeNode("child")
+    #                         neighbor_node.parent=nextup
+    #                         neighbor_node.x=x_n
+    #                         neighbor_node.y=y_n
+    #                         neighbor_node.cost = new_cost
 
-                            counter += 1 # update tiebreaker
-                            heapq.heappush(priority_queue, (new_cost, counter, neighbor_node)) # adding to pq
+    #                         counter += 1 # update tiebreaker
+    #                         heapq.heappush(priority_queue, (new_cost, counter, neighbor_node)) # adding to pq
 
-        if goal_node is None: # if we coudn't find the goal node
-            self.get_logger().info("ALL Points Explored.")
-            self.frontier_path = None
-            self._fsm = fsm.OFF
-            self.computing_frontier_path = False
-            return None
+    #     if goal_node is None: # if we coudn't find the goal node
+    #         self.get_logger().info("ALL Points Explored.")
+    #         self.frontier_path = None
+    #         self._fsm = fsm.OFF
+    #         self.computing_frontier_path = False
+    #         return None
         
-        else:# if found, we can backtrack from the goal node to the start to get the path
-            bfs_node_path = [goal_node]
-            while True:
-                bfs_node_path.insert(0, bfs_node_path[0].parent)
-                if bfs_node_path[0].name == "root":
-                    break
+    #     else:# if found, we can backtrack from the goal node to the start to get the path
+    #         bfs_node_path = [goal_node]
+    #         while True:
+    #             bfs_node_path.insert(0, bfs_node_path[0].parent)
+    #             if bfs_node_path[0].name == "root":
+    #                 break
             
-            self.frontier_path = [(n.x,n.y) for n in bfs_node_path] # we want a list of just the point values
-            # update state machine
-            if self._fsm != fsm.RECOVERY:
-                self._fsm = fsm.ON
+    #         self.frontier_path = [(n.x,n.y) for n in bfs_node_path] # we want a list of just the point values
+    #         # update state machine
+    #         if self._fsm != fsm.RECOVERY:
+    #             self._fsm = fsm.ON
 
-            np.save('./waypoint_path_data_pa4.npy', self.frontier_path) # saving the smoothed map
-            self.computing_frontier_path = False
-            return (goal_node.x, goal_node.y)
+    #         np.save('./waypoint_path_data_pa4.npy', self.frontier_path) # saving the smoothed map
+    #         self.computing_frontier_path = False
+    #         return (goal_node.x, goal_node.y)
 
 
-    def is_frontier_cell(self, map, x, y):
-        """returns true if the inputted point is free space on SLAM map and next to -1"""
-        if map[y][x] >= self.MAP_CLEAR_THRESHOLD and map[y][x] != -1 :
-            return False # if occupied or unexplored, not frontier cell...
+    # def is_frontier_cell(self, map, x, y):
+    #     """returns true if the inputted point is free space on SLAM map and next to -1"""
+    #     if map[y][x] >= self.MAP_CLEAR_THRESHOLD and map[y][x] != -1 :
+    #         return False # if occupied or unexplored, not frontier cell...
         
-        # list of relative neighbors to a node
-        neighbor_list = [
-                         (0,1),
-                (-1,0),          (1,0),
-                         (0,-1)
-                ]   
+    #     # list of relative neighbors to a node
+    #     neighbor_list = [
+    #                      (0,1),
+    #             (-1,0),          (1,0),
+    #                      (0,-1)
+    #             ]   
         
-        for dx, dy in neighbor_list:
-            xn = x + dx # neigbor coordiante x
-            yn = y + dy # neigbor coordiante y
-            if (0 <= xn < self.SLAM_MAP_SIZE_X and 0 <= yn < self.SLAM_MAP_SIZE_Y): # if neighbor in bounds
-                if map[yn][xn] == -1: # if unexplored cell is neighbor 
-                    return True
+    #     for dx, dy in neighbor_list:
+    #         xn = x + dx # neigbor coordiante x
+    #         yn = y + dy # neigbor coordiante y
+    #         if (0 <= xn < self.SLAM_MAP_SIZE_X and 0 <= yn < self.SLAM_MAP_SIZE_Y): # if neighbor in bounds
+    #             if map[yn][xn] == -1: # if unexplored cell is neighbor 
+    #                 return True
                 
-        return False
+    #     return False
 
 
 
-    def gaussianSmoothing(self, to_smooth_array, kernel_size, sigma):
-        """This will apply gaussian smoothing to the inputted 2D array and return smoothed array as output"""
+    # def gaussianSmoothing(self, to_smooth_array, kernel_size, sigma):
+    #     """This will apply gaussian smoothing to the inputted 2D array and return smoothed array as output"""
         
-        if to_smooth_array is None: # have to call this after occupancy grid is called
-            return None
+    #     if to_smooth_array is None: # have to call this after occupancy grid is called
+    #         return None
         
-        height = to_smooth_array.shape[0]
-        width = to_smooth_array.shape[1]
+    #     height = to_smooth_array.shape[0]
+    #     width = to_smooth_array.shape[1]
 
-        # constructing the kernel from the gaussian blur formula https://en.wikipedia.org/wiki/Gaussian_blur
-        kernel = []
-        for y in range(-kernel_size//2, kernel_size//2 +1):
-            row = []
-            for x in range(-kernel_size//2, kernel_size//2 +1):
-                row.append(1/(2*math.pi*sigma**2) * math.exp(-1*(x**2 +y**2)/(2*sigma**2)))
-            kernel.append(row)
+    #     # constructing the kernel from the gaussian blur formula https://en.wikipedia.org/wiki/Gaussian_blur
+    #     kernel = []
+    #     for y in range(-kernel_size//2, kernel_size//2 +1):
+    #         row = []
+    #         for x in range(-kernel_size//2, kernel_size//2 +1):
+    #             row.append(1/(2*math.pi*sigma**2) * math.exp(-1*(x**2 +y**2)/(2*sigma**2)))
+    #         kernel.append(row)
         
-        kernel = np.array(kernel) # convert to np array
-        kernel = kernel / np.sum(kernel)
+    #     kernel = np.array(kernel) # convert to np array
+    #     kernel = kernel / np.sum(kernel)
         
-        self.smoothedMap = np.zeros((height, width), dtype=np.float32)
-        # now we apply the kernel to the occupancy grid to 
-        for y in range(0, height):
-            for x in range(0, width):
-                # for each point in the occupancy grid, we need the kernel_size x kernel_size grid aroudn that sqaure
-                neighborhood = []
-                for y_n in range(-kernel_size//2, kernel_size//2 +1):
-                    neighborhood_row = []
-                    for x_n in range(-kernel_size//2, kernel_size//2+ 1):
-                        if (0<=y+y_n and y+y_n <height and 0<=x+x_n and x+x_n <width):
-                            if (to_smooth_array[y+y_n][x+x_n] >=0 ):
-                                neighborhood_row.append(to_smooth_array[y+y_n][x+x_n])
-                            else:
-                                neighborhood_row.append(0)
-                        else:
-                            neighborhood_row.append(0)
-                    neighborhood.append(neighborhood_row)
+    #     self.smoothedMap = np.zeros((height, width), dtype=np.float32)
+    #     # now we apply the kernel to the occupancy grid to 
+    #     for y in range(0, height):
+    #         for x in range(0, width):
+    #             # for each point in the occupancy grid, we need the kernel_size x kernel_size grid aroudn that sqaure
+    #             neighborhood = []
+    #             for y_n in range(-kernel_size//2, kernel_size//2 +1):
+    #                 neighborhood_row = []
+    #                 for x_n in range(-kernel_size//2, kernel_size//2+ 1):
+    #                     if (0<=y+y_n and y+y_n <height and 0<=x+x_n and x+x_n <width):
+    #                         if (to_smooth_array[y+y_n][x+x_n] >=0 ):
+    #                             neighborhood_row.append(to_smooth_array[y+y_n][x+x_n])
+    #                         else:
+    #                             neighborhood_row.append(0)
+    #                     else:
+    #                         neighborhood_row.append(0)
+    #                 neighborhood.append(neighborhood_row)
 
-                # Element-wise multiply and sum
-                neighborhood = np.array(neighborhood, dtype=np.float32)
-                self.smoothedMap[y, x] = np.sum(neighborhood * kernel) # updating the smoothed map
+    #             # Element-wise multiply and sum
+    #             neighborhood = np.array(neighborhood, dtype=np.float32)
+    #             self.smoothedMap[y, x] = np.sum(neighborhood * kernel) # updating the smoothed map
         
-        # with large sigma, the threshold values for the walls get dimmed way down, so we have to recale
-        max_val = np.max(self.smoothedMap) # find teh largest value in the map
+    #     # with large sigma, the threshold values for the walls get dimmed way down, so we have to recale
+    #     max_val = np.max(self.smoothedMap) # find teh largest value in the map
 
-        # Scale everything proportionally
-        scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
-        scaled[self.smoothedMap == 0] = 0 # 0 stays as 0
-        self.smoothedMap = scaled.astype(np.int8) # convert to integre
+    #     # Scale everything proportionally
+    #     scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
+    #     scaled[self.smoothedMap == 0] = 0 # 0 stays as 0
+    #     self.smoothedMap = scaled.astype(np.int8) # convert to integre
        
 
-        self.smoothedMap = self.smoothedMap.astype(np.int8) #cast to make sure we cast to become integers, because OccupancyGrid topic has int8 datatype
-        # now copying over teh hard 100 values from the occupancy grid to make sure sure
-        for y in range(0,height):
-            for x in range(0,width):
-                if to_smooth_array[y][x] ==100:
-                    self.smoothedMap[y][x] = 100
-                if to_smooth_array[y][x] == -1: # we can't smooth over unexplored cells #TODO: we do still include unexplored pixels in the smoothing
-                    self.smoothedMap[y][x] = -1
+    #     self.smoothedMap = self.smoothedMap.astype(np.int8) #cast to make sure we cast to become integers, because OccupancyGrid topic has int8 datatype
+    #     # now copying over teh hard 100 values from the occupancy grid to make sure sure
+    #     for y in range(0,height):
+    #         for x in range(0,width):
+    #             if to_smooth_array[y][x] ==100:
+    #                 self.smoothedMap[y][x] = 100
+    #             if to_smooth_array[y][x] == -1: # we can't smooth over unexplored cells #TODO: we do still include unexplored pixels in the smoothing
+    #                 self.smoothedMap[y][x] = -1
                 
-        return self.smoothedMap
+    #     return self.smoothedMap
 
     
-    def obstacle_inflation(self, to_inflate_map, protection_radius, resolution):
-        """This function returns a map with inflated obstacles so the robot doesn't collide"""
-        if to_inflate_map is None:
-            return None
+    # def obstacle_inflation(self, to_inflate_map, protection_radius, resolution):
+    #     """This function returns a map with inflated obstacles so the robot doesn't collide"""
+    #     if to_inflate_map is None:
+    #         return None
 
-        inflated = np.copy(to_inflate_map)
-        height, width = to_inflate_map.shape
+    #     inflated = np.copy(to_inflate_map)
+    #     height, width = to_inflate_map.shape
 
-        # getting the protection radius in cells
-        radius_cells = int(protection_radius//resolution + 1)
-        # getting obstacle cells
-        obstacle_cells = np.argwhere(to_inflate_map >=  CELL_PROBABILITY_OCCUPIED)  # rows=y, cols=x
-        # inflating area around obstacle cells
-        for y, x in obstacle_cells:
-            for dy in range(-radius_cells, radius_cells + 1):
-                for dx in range(-radius_cells, radius_cells + 1):
-                    if dx*dx + dy*dy <= radius_cells**2:
-                        ny = y + dy
-                        nx = x + dx
+    #     # getting the protection radius in cells
+    #     radius_cells = int(protection_radius//resolution + 1)
+    #     # getting obstacle cells
+    #     obstacle_cells = np.argwhere(to_inflate_map >=  CELL_PROBABILITY_OCCUPIED)  # rows=y, cols=x
+    #     # inflating area around obstacle cells
+    #     for y, x in obstacle_cells:
+    #         for dy in range(-radius_cells, radius_cells + 1):
+    #             for dx in range(-radius_cells, radius_cells + 1):
+    #                 if dx*dx + dy*dy <= radius_cells**2:
+    #                     ny = y + dy
+    #                     nx = x + dx
 
-                        if 0 <= ny < height and 0 <= nx < width:
-                            inflated[ny][nx] = 100
+    #                     if 0 <= ny < height and 0 <= nx < width:
+    #                         inflated[ny][nx] = 100
 
-        return inflated
+    #     return inflated
 
     def get_nearest_free_cell(self, x, y, search_map):
         """Returns nearest free cell to inputted point, searching outward in a spiral"""
@@ -796,6 +821,36 @@ class WorldMapper(Node):
         # current 
         return (x_pos_odom, y_pos_odom, robot_angle)
 
+
+    def publish_pose(self, timestamp):
+        """This function publishes this robots pose (relative to odom reference frame) to self._pose_pub"""
+        # first getting the pose of the robot relative to odom
+        transform = self._tf_buffer.lookup_transform(
+            'rosbot/odom',         # The reference frame we are converting to (target)
+            'rosbot/base_link',    # The reference frame we are converting from (source)
+            rclpy.time.Time() # this time value is like 0/null so it returns latest availiable transform
+        )
+                
+        # current point of robot
+        x_pos_odom = transform.transform.translation.x # x coordinate of base link in odom reference frame
+        y_pos_odom = transform.transform.translation.y # y coordinate of base link in odom reference frame
+
+        # current angle of robot
+        robot_angle_quat = transform.transform.rotation # curent angle as quaternion
+
+        # creating the message
+        msg = PoseStamped()
+        # filling in the data
+        msg.header.stamp = timestamp.to_msg()
+        msg.header.frame_id = "rosbot/odom" # TODO: not sure if this is the correct frame id
+
+        msg.pose.position.x = x_pos_odom
+        msg.pose.position.y = y_pos_odom
+        msg.pose.orientation = robot_angle_quat
+        #publishing the message
+        self._pose_pub.publish(msg)
+
+
     def get_laser_point_in_odom(self, timestamp, x, y):
         """This function returns (x,y,theta) position and rotation of the robot (base_link) in the odom reference frame"""
         transform = self._tf_buffer.lookup_transform(
@@ -824,7 +879,14 @@ class WorldMapper(Node):
 
 
     def _control_loop_callback(self): # will be called every self.delta_t seconds 
-        if self._fsm == fsm.OFF or self._fsm==fsm.WAITING_FOR_PATH : # if robot is turned off or waiting for path, we do nothing
+
+        if self._fsm == fsm.OFF: # if robot is off, do nothing
+            return
+
+        # publish the robot's position
+        self.publish_pose(self.get_clock().now())
+
+        if self._fsm==fsm.WAITING_FOR_PATH : # if robot is waiting for path, we do nothing
             return
         
         if self._fsm == fsm.RECOVERY and  self._recovery_fsm == recovery_fsm.WAITING_FOR_PATH:
@@ -926,6 +988,7 @@ def main(args=None):
         world_mapper.start()
         rclpy.spin(world_mapper)
     except KeyboardInterrupt:
+        world_mapper.shutdown_mapper()
         world_mapper.get_logger().error("ROS node interrupted.")
     finally:
         if rclpy.ok():
