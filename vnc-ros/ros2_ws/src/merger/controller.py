@@ -4,20 +4,20 @@ ROS2 node that wraps the coordinator module into the coordinating
 process described in the project proposal.
 
 Responsibilities:
-  * subscribes to each robot's /SLAM_map (nav_msgs/OccupancyGrid) topic;
-  * tracks how many cells have changed from unknown -> known per robot;
-  * once a robot has converted N cells (TRANSFORM_RETRY_CELLS), attempts a
-    new alignment between its grid and every other robot's grid;
-  * publishes the merged occupancy grid on /merged_map every time a new map
-    is successfully fused;
-  * broadcasts a static TF from each robot's odom frame to the merged-map
+- subscribes to each robot's /SLAM_map (nav_msgs/OccupancyGrid) topic
+- tracks how many cells have changed from unknown -> known per robot
+- once a robot has converted N cells (TRANSFORM_RETRY_CELLS), attempts a
+    new alignment between its grid and every other robot's grid
+- publishes the merged occupancy grid on /merged_map every time a new map
+    is successfully fused
+- broadcasts a static TF from each robot's odom frame to the merged-map
     frame (the "global" frame) so the rest of the system can transform
-    poses, target detections, and paths into the shared coordinate space.
-  * pose subscriptions to /robotN/odom are stubbed in but not used by the
-    coordinator itself -- the planner node will read those.
-  * confidence threshold defaults to 0.5 (the value used in the demo). It
+    poses, target detections, and paths into the shared coordinate space
+- pose subscriptions to /robotN/odom are stubbed in but not used by the
+    coordinator itself -- the planner node will read those
+- confidence threshold defaults to 0.5 (the value used in the demo). It
     can be raised in launch parameters once we tune against real robot
-    runs.
+    runs
 
 """
 
@@ -30,7 +30,7 @@ from typing import Dict, Tuple, Optional
 
 import numpy as np
 
-import coordinator as mc
+import map_coordinator as mc
 
 
 # Constants
@@ -162,7 +162,7 @@ def build_node():
             # /<robot_id>/SLAM_map.
             self._subs = []
             for rid in robot_ids:
-                topic = f'/SLAM_map_{rid}'
+                topic = f'/{rid}/map'
                 self.get_logger().info(f'subscribing to {topic}')
                 sub = self.create_subscription(
                     OccupancyGrid, topic,
@@ -209,7 +209,7 @@ def build_node():
                 return
 
             # Robot 1 is always the anchor when it participates, so the merged
-            # map ends up in the odom_1 frame as agreed with the team.
+            # map ends up in the odom_1 frame
             pairs = []
             if "1" in ready:
                 for other in ready:
@@ -228,7 +228,7 @@ def build_node():
             anchor = self.robot_states[anchor_id]
             follower = self.robot_states[follower_id]
 
-            # Both grids must share resolution; if they don't, we can't merge
+            # Both grids must share resolution, if they don't, we can't merge
             # without resampling, which our pipeline does not currently do.
             if abs(anchor.resolution - follower.resolution) > 1e-4:
                 self.get_logger().warn(
@@ -295,7 +295,7 @@ def build_node():
                 resolution=anchor.resolution,
                 origin_x=new_origin_x,
                 origin_y=new_origin_y,
-                frame_id=f'odom_1',
+                frame_id=f'robot1/odom',
                 stamp=self.get_clock().now().to_msg(),
             )
             self._merged_pub.publish(msg)
@@ -325,8 +325,8 @@ def build_node():
 
             t = TransformStamped()
             t.header.stamp = self.get_clock().now().to_msg()
-            t.header.frame_id = f'odom_{anchor_id}'
-            t.child_frame_id = f'odom_{follower_id}'
+            t.header.frame_id = f'{anchor_id}/odom'
+            t.child_frame_id = f'{follower_id}/odom'
             t.transform.translation.x = tx
             t.transform.translation.y = ty
             t.transform.translation.z = 0.0

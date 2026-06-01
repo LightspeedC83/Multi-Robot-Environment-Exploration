@@ -15,7 +15,7 @@
 #  6. Warp robot B's grid into robot A's frame and fuse the two grids by
 #     combining log-odds for each cell.
 
-#his module is intentionally only numpy and OpenCV so it can be unit tested
+#this module is intentionally only numpy and OpenCV so it can be unit tested
 #without ROS2. Integration is a thin wrapper that hands occupancy-grid messages
 #to `merge_maps`.
 
