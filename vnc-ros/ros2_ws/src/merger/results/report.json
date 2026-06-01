@@ -1,0 +1,41 @@
+{
+  "ground_truth": {
+    "theta_rad": 0.2617993877991494,
+    "theta_deg": 14.999999999999998,
+    "tx_cells_applied_to_b": 35.0,
+    "ty_cells_applied_to_b": -20.0,
+    "b_canvas_padding": 40,
+    "explore_radius_cells": 15
+  },
+  "diagnostics": {
+    "kp_a": 124,
+    "kp_b": 2442,
+    "good_matches": 55,
+    "inliers": 21,
+    "n_candidates": 1,
+    "disambig_rotation_deg": 0.0,
+    "overlap_cells": 28491,
+    "wall_union_cells": 689,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8408889675934125
+  },
+  "confidence": 0.8067143230122719,
+  "success": true,
+  "transform_meters": {
+    "tx": -3.434058816611353,
+    "ty": -0.5796907793740018,
+    "theta": -0.261798667313534
+  },
+  "transform_pixels": [
+    [
+      0.9659260127642165,
+      0.2588183491667902,
+      -68.68117633222705
+    ],
+    [
+      -0.2588183491667902,
+      0.9659260127642165,
+      -11.593815587480035
+    ]
+  ]
+}
