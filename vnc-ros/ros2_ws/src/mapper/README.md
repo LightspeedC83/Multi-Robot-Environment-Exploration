@@ -81,3 +81,18 @@ Normal operation has following values in the occupancy grid:
 - Occupied (100): Cells where a laser "hit" was recorded.
 
 When `PROBABILISTIC_MAPPING` is False, the robot operates in normal mode, as outlined above. But when `PROBABILISTIC_MAPPING` is True, the robot implements a recursive Bayesian update using log-odds to make the map resilient to sensor noise. Where the value in the grid falls in a range from 0 to 100, and reprensents the probability (percent) that the cell is occupied. A value of -1 still means that the cell has not been explored.  
+
+# Coordinator node
+
+## topic list
+- nav_path_`id`
+- pose_`id`
+- SLAM_map_`id`
+- id_active_`id`
+
+## services
+the coordinator runs 2 services:
+- Type: GetUniqueID, Name: `'get_unique_id'`
+- Type: GetNewFrontierPath, Name: `'get_path'`
+
+

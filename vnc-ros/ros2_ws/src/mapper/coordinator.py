@@ -24,12 +24,12 @@ from rclpy.signals import SignalHandlerOptions
 from nav_msgs.msg import OccupancyGrid # message type for occupancyGrid
 from  nav_msgs.msg import MapMetaData # for the slam_map msg.info
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray, Point, Quaternion # for the ifnromation stored in slam_map msg.info
-from tf2_ros import TransformListener, Buffer
-from std_msgs.msg import Bool # for id_active publisher
+from std_msgs.msg import Bool, Int32 # for id_active publisher
+
 
 # importing custom services
 from mapper_interfaces.srv import GetUniqueID
-
+from mapper_interfaces.srv import GetNewFrontierPath
 
 ## Constants ##
 NEIGHBOR_LIST = [  # list of relative neighbors to a node
@@ -47,8 +47,9 @@ NEIGHBOR_LIST = [  # list of relative neighbors to a node
 PROTECTION_RADIUS = 0.3 # [m]
 SMOOTHING_KERNEL_SIZE = 10  # the kernel size applied to the gaussian smoothing algorithm
 SMOOTHING_SIGMA = 6 # The standard deviation applied to the gaussian smoothing algorithm
-MAP_CLEAR_THRESHOLD = 33 # program treats any value below this as free space
 
+MAP_CLEAR_THRESHOLD = 33 # program treats any value below this as free space
+MAP_OCCUPIED_THRESHOLD = 80 # program treats any value above this as occupied and to be avoided
 # Topic names
 
 # Frequency at which the loop operates
@@ -85,9 +86,21 @@ class Coordinator(Node):
         self.ids_active = {} # dictionary that stores robot_id --> bool for if the robot is active or not
 
         ## setting up unique ID service ##
-        self.srv = self.create_service(GetUniqueID, 'get_unique_id', self.handle_id_request)
+        self.is_srv = self.create_service(GetUniqueID, 'get_unique_id', self.handle_id_request)
         self.global_id = 0  # define a global ID tracker (current global id is the most recent id assigned)
-    
+
+        ## setting up a path generation service ##
+        self.path_srv = self.create_service(GetNewFrontierPath, 'get_path', self.handle_path_request)
+
+        ## setting up new_robot_id topic
+        self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id", 1)
+
+        ## setting up subscriber to the merged_map topic 
+        # right now the merged map always treats robot_1 
+        self.merged_map_sub = self.create_subscription(OccupancyGrid, "merged_map", self._merged_map_callback, 1)
+        self.merged_map_info = None
+        self.merged_map = None
+
     def handle_id_request(self, request, response):
         """This is the callback function to handle the server side of the GetUniqueID service"""
         self.global_id +=1 
@@ -101,8 +114,40 @@ class Coordinator(Node):
         self.setup_listeners(self.global_id)
         self.setup_publishers(self.global_id)
 
+        # publishing the new id to the /new_robot_id topic
+        new_id_msg = Int32()
+        new_id_msg.data = self.global_id
+        self.new_robot_id_publisher.publish(new_id_msg)
+
         return response
     
+    def handle_path_request(self, request, response):
+        """this function callback handles the server side of the GetNewFrontierPath Service"""
+        # getting request data
+        self.get_logger().info(f"received path generation request from {request.requester_name}")
+        requester_id = request.requester_id
+        
+        #  if id is invalid
+        if requester_id <= 0 or requester_id is None:
+            response.success = False
+            response.message = "Requester has no id"
+            self.get_logger().warn("received path request from robot with no ID")
+            return response
+
+        # generating path
+        result = self.single_robot_plan(requester_id)
+
+        # sending response
+        if result == False:
+            response.success = False 
+            response.message = "No path able to be found to goal frontier node"
+        else:
+            response.success = True 
+            response.message = f"path to next frontier in nav_path_{requester_id}"
+        
+        return response
+
+
 
     def _wait_for_sim_ready(self, timeout_sec):
         """Wait until simulation clock and cmd_vel subscriber are ready."""
@@ -129,7 +174,7 @@ class Coordinator(Node):
     def setup_publishers(self, robot_id):
         """setus up all the publishers for this robot"""
         # path publisher
-        path_publisher = self.create_publisher(PoseArray, f"nav_paths_{robot_id}")
+        path_publisher = self.create_publisher(PoseArray, f"nav_path_{robot_id}", 1)
         self.path_publishers_dictionary[robot_id] = path_publisher
 
 
@@ -137,9 +182,9 @@ class Coordinator(Node):
         """creates listeners for the various subscirptions for a given robot id (stores in subsciription_dictionary[id])"""
         poseStamped_sub = self.create_subscription(PoseStamped, f"pose_{robot_id}", functools.partial(self._pose_callback, robot_id=robot_id), 1)
 
-        occupancyGrid_sub = self.create_subscription(OccupancyGrid, f"SLAM_map_{robot_id}", self.functools.partial(self._map_callback, robot_id=robot_id), 1)
+        occupancyGrid_sub = self.create_subscription(OccupancyGrid, f"SLAM_map_{robot_id}", functools.partial(self._map_callback, robot_id=robot_id), 1)
 
-        id_active_sub = self.create_subscription(Bool, f"id_active_{robot_id}", self.functools.partial(self._id_active_callback, robot_id=robot_id), 1)
+        id_active_sub = self.create_subscription(Bool, f"id_active_{robot_id}", functools.partial(self._id_active_callback, robot_id=robot_id), 1)
 
         self.subscription_dictionary[robot_id] = (poseStamped_sub, occupancyGrid_sub, id_active_sub)
 
@@ -163,7 +208,21 @@ class Coordinator(Node):
             if self.ids_active[id]:
                 num_active_robots+=1
         self.num_active_robots = num_active_robots
+
+    def _merged_map_callback(self, msg:OccupancyGrid):
+        """Callback function for updating the local version of the merged map, updates self.merged_map_info (a MapMetaData) and self.merged_map (a 2D array) """
+        self.merged_map_timestamp = msg.header.stamp
+
+        self.merged_map_info = msg.info
+        merged_map_resolution = resolution = self.merged_map_info.resolution
+        merged_map_origin_x = self.merged_map_info.origin.position.x
+        merged_map_origin_y = self.merged_map_info.origin.position.y
+        merged_map_origin_theta = self.quaternion_to_theta(self.merged_map_info.origin.orientation)
         
+        flat_arr = msg.data
+        self.merged_map = np.reshape(flat_arr, (self.merged_map_info.height, self.merged_map_info.width))
+
+
 
     def unpack_map_msg(self, map_msg):
         """ returns a occupancy grid (2D array), resolution, x_occupancy_grid_origin, y_occupancy_grid_origin, origin_rotation, map_width, map_height, timestamp """
@@ -178,7 +237,7 @@ class Coordinator(Node):
         flat_arr = map_msg.data
         grid = np.reshape(flat_arr, (mapinfo.height, mapinfo.width))
 
-        return grid, resolution, x_occupancy_grid_origin, y_occupancy_grid_origin, theta_occupancy_grid_origin, mapinfo.height, mapinfo.width, timestamp
+        return grid, resolution, x_occupancy_grid_origin, y_occupancy_grid_origin, theta_occupancy_grid_origin, mapinfo.width, mapinfo.height, timestamp
 
     def unpack_pose_msg(self, pose_msg):
         """retuns x, y, theta, timestamp"""
@@ -204,7 +263,7 @@ class Coordinator(Node):
         return theta
     
     
-    def odom_to_cell(x_robot_odom, y_robot_odom, x_map_origin, y_map_origin, theta_map_origin, map_res):
+    def odom_to_cell(self, x_robot_odom, y_robot_odom, x_map_origin, y_map_origin, theta_map_origin, map_res):
         """Convert a point in odom/world coordinates to occupancy grid cell coordinates."""
         # translation
         dx = x_robot_odom - x_map_origin
@@ -236,7 +295,15 @@ class Coordinator(Node):
 
     ### Code For Path Planning per robot ###
     def single_robot_plan(self, robot_id):
-        """broadcasts plans for frontier exploraiton of a single robot"""
+        """broadcasts plans for frontier exploraiton of a single robot, returns true if path was broadcasted, false if no path found"""
+
+        if robot_id not in self.map_msgs:
+            self.get_logger().warn(f"No map yet for robot {robot_id}")
+            return False
+
+        if robot_id not in self.pose_msgs:
+            self.get_logger().warn(f"No pose yet for robot {robot_id}")
+            return False
 
         # first get the most recent SLAM Map for this robot
         map, grid_res, x_grid_origin, y_grid_origin, theta_grid_origin, map_width, map_height, map_timestamp = self.unpack_map_msg(self.map_msgs[robot_id])
@@ -249,14 +316,16 @@ class Coordinator(Node):
 
         # find the path to the best frontier point in cell coords
         path_cell = self.get_frontier_path(map, x_map, y_map, map_width, map_height, grid_res)
-
+        if path_cell is None: 
+            return False
+        
         # convert the path to this robot's odom coordinates
         path_odom = [self.cell_to_odom(pt[0], pt[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res) for pt in path_cell] 
 
         # broadcast the path to the robot
         # first convert to a PoseArray message
         pose_arr_msg = PoseArray()
-        pose_arr_msg.header.stamp = self.get_clock().now()
+        pose_arr_msg.header.stamp = self.get_clock().now().to_msg()
         pose_arr_msg.header.frame_id = self.map_msgs[robot_id].header.frame_id # assigning the frame id as the same as received
         pose_arr_msg.poses = []
         for pt in path_odom:
@@ -269,6 +338,7 @@ class Coordinator(Node):
         # now publish
         pose_pub = self.path_publishers_dictionary[robot_id]
         pose_pub.publish(pose_arr_msg)
+        return True
 
 
     def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell):
@@ -292,14 +362,17 @@ class Coordinator(Node):
         obstacle_avoidance_search_map[free_cells] = smoothed_SLAM_map[free_cells]
 
         # self.get_logger().info(obstacle_avoidance_search_map)
-        np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
+        # np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
-        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map) # snap to nearest free space as start point
+        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
 
         # getting the goal point
         ranked_frontiers = self.rank_frontiers(map, x_pos_map, y_pos_map, map_width, map_height) 
         goal_point = ranked_frontiers[0][0] # best frontier (one with lowest score will be first in list, and it's index 0 in the pt,score tuple)
-
+        if len(ranked_frontiers) == 0:
+            self.get_logger().warn("No frontiers found")
+            return None
+    
         # A* to find the best path to the goal frontier point
 
         # list of relative neighbors to a node
@@ -321,6 +394,8 @@ class Coordinator(Node):
         while len(priority_queue) != 0:
             self.a_star_count+=1
             _, _, nextup = heapq.heappop(priority_queue)
+            seen_cells[nextup.y][nextup.x] = True # mark as visited
+
             # checking if the next cell is the goal
             if nextup.y == goal_point[1] and nextup.x == goal_point[0]: # if we've found the goal point
                 goal_node = nextup 
@@ -328,7 +403,7 @@ class Coordinator(Node):
             #going through all the points neighboring the nextup
             for neighbor in neighbor_list:
                 x_n, y_n = neighbor[0]+nextup.x, neighbor[1]+nextup.y # getting neighbor point coordinates
-                if (0<=x_n<map_width and 0<=y_n<map_height) and map[y_n][x_n]<=MAP_CLEAR_THRESHOLD: # if the neighbor point is valid & unoccupied
+                if (0<=x_n<map_width and 0<=y_n<map_height) and 0<=obstacle_avoidance_search_map[y_n][x_n]<=MAP_CLEAR_THRESHOLD: # if the neighbor point is valid & unoccupied
                     
                     if not seen_cells[y_n][x_n]: # if the neighbor isn't already visited 
                         # creating a neighbor node to add to the graph as child of nextup
@@ -339,11 +414,11 @@ class Coordinator(Node):
                         neighbor_node.cost=nextup.cost+self.euclidean_distance((nextup.x, nextup.y), (x_n, y_n)) 
 
                         #assigning the prioirty queue weight of the node we're about to add
-                        weight = neighbor_node.cost + map[y_n][x_n] + self.euclidean_distance((x_n,y_n), goal_point) # weigth is cost from the smoothed map plus euclidean distance
+                        weight = neighbor_node.cost + obstacle_avoidance_search_map[y_n][x_n] + self.euclidean_distance((x_n,y_n), goal_point) # weigth is cost from the smoothed map plus euclidean distance
     
                         heapq.heappush(priority_queue, (weight, counter, neighbor_node))
                         counter +=1
-                        seen_cells[y_n][x_n] = True
+                        
 
         if goal_node is None: # if we coudn't find the goal node
             self.get_logger().warn("Planner: A* search not able to find a reachable goal; all frontiers explored")
@@ -352,13 +427,12 @@ class Coordinator(Node):
         else:# if found, we can backtrack from the goal node to the start to get the path
             a_star_node_path = [goal_node]
             while True:
-                a_star_node_path.insert(0, a_star_node_path[0].parent)
-                if a_star_node_path[0].name == "root":
+                if a_star_node_path[0].name == "root": # break before we add the root node, which is the start point, the point the robot is already on
                     break
-            
+                a_star_node_path.insert(0, a_star_node_path[0].parent)
+                
             a_star_path = [(n.x,n.y) for n in a_star_node_path] # we want a list of just the point values
             return a_star_path
-
 
 
     def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height):
@@ -374,7 +448,7 @@ class Coordinator(Node):
         seen_cells[y_pos_map][x_pos_map] = True
         while len(queue) > 0:
             nextup = queue.pop(0)
-            if (self.is_frontier_cell(map, nextup[0], nextup[1])):
+            if (self.is_frontier_cell(map, nextup[0], nextup[1], map_width, map_height)):
                 frontier_points.append(nextup)
             
             for neighbor in NEIGHBOR_LIST:
@@ -401,14 +475,27 @@ class Coordinator(Node):
         score = distance_to_robot
         return score
 
-    def euclidean_distance(p1, p2):
+    def euclidean_distance(self, p1, p2):
         """returns euclidean distance between 2 points (x,y) tuple"""
         return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
     
+    def get_nearest_free_cell(self, x, y, search_map, search_map_x, search_map_y):
+        """Returns nearest free cell to inputted point, searching outward in a spiral"""
+        for radius in range(0, search_map.shape[0]):
+            for dx in range(-radius, radius+1):
+                for dy in range(-radius, radius+1):
+                    if abs(dx) != radius and abs(dy) != radius:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if (0 <= nx < search_map_x and 
+                        0 <= ny < search_map_y and
+                        0 <= search_map[ny][nx] <= MAP_CLEAR_THRESHOLD):
+                        return nx, ny
+        return x, y  
 
-    def is_frontier_cell(self, map, x, y):
+    def is_frontier_cell(self, map, x, y, map_width, map_height):
         """returns true if the inputted point is free space on SLAM map and next to -1"""
-        if map[y][x] >= self.MAP_CLEAR_THRESHOLD and map[y][x] != -1 :
+        if map[y][x] >= MAP_CLEAR_THRESHOLD and map[y][x] != -1 :
             return False # if occupied or unexplored, not frontier cell...
         
         # list of relative neighbors to a node
@@ -421,7 +508,7 @@ class Coordinator(Node):
         for dx, dy in neighbor_list:
             xn = x + dx # neigbor coordiante x
             yn = y + dy # neigbor coordiante y
-            if (0 <= xn < self.SLAM_MAP_SIZE_X and 0 <= yn < self.SLAM_MAP_SIZE_Y): # if neighbor in bounds
+            if (0 <= xn < map_width and 0 <= yn < map_height): # if neighbor in bounds
                 if map[yn][xn] == -1: # if unexplored cell is neighbor 
                     return True
                 
@@ -473,7 +560,11 @@ class Coordinator(Node):
         max_val = np.max(self.smoothedMap) # find teh largest value in the map
 
         # Scale everything proportionally
-        scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
+        if max_val == 0:
+            scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
+        else:
+            scaled = self.smoothedMap
+
         scaled[self.smoothedMap == 0] = 0 # 0 stays as 0
         self.smoothedMap = scaled.astype(np.int8) # convert to integre
        
@@ -500,7 +591,7 @@ class Coordinator(Node):
         # getting the protection radius in cells
         radius_cells = int(protection_radius//resolution + 1)
         # getting obstacle cells
-        obstacle_cells = np.argwhere(to_inflate_map >=  CELL_PROBABILITY_OCCUPIED)  # rows=y, cols=x
+        obstacle_cells = np.argwhere(to_inflate_map >=  MAP_OCCUPIED_THRESHOLD)  # rows=y, cols=x
         # inflating area around obstacle cells
         for y, x in obstacle_cells:
             for dy in range(-radius_cells, radius_cells + 1):
@@ -515,11 +606,7 @@ class Coordinator(Node):
         return inflated
 
     def _control_loop_callback(self): # will be called every self.delta_t seconds 
-        if self.num_active_robots <= 0: # if no active robots we do nothing
-            return
-        for id in range(self.global_id+1): # for all ids we've assigned
-            if self.ids_active[id]: # if this id is active
-                self.single_robot_plan(id)
+        pass
             
 
 
