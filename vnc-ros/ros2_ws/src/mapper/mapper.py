@@ -173,7 +173,6 @@ class WorldMapper(Node):
 
         self.nav_path = None # This is the path of points (in robot/odom coordinates) to the nearest frontier node
         self.last_nav_path_timestamp = rclpy.time.Time()
-        # self.computing_frontier_path = False # so that the robot doesn't pathfind when stuck when its still pathfinding
         
 
         self.PROTECTION_RADIUS = PROTECTION_RADIUS

@@ -94,7 +94,13 @@ class Coordinator(Node):
 
         ## setting up new_robot_id topic
         self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id", 1)
-    
+
+        ## setting up subscriber to the merged_map topic 
+        # right now the merged map always treats robot_1 
+        self.merged_map_sub = self.create_subscription(OccupancyGrid, "merged_map", self._merged_map_callback, 1)
+        self.merged_map_info = None
+        self.merged_map = None
+
     def handle_id_request(self, request, response):
         """This is the callback function to handle the server side of the GetUniqueID service"""
         self.global_id +=1 
@@ -202,6 +208,20 @@ class Coordinator(Node):
             if self.ids_active[id]:
                 num_active_robots+=1
         self.num_active_robots = num_active_robots
+
+    def _merged_map_callback(self, msg:OccupancyGrid):
+        """Callback function for updating the local version of the merged map, updates self.merged_map_info (a MapMetaData) and self.merged_map (a 2D array) """
+        self.merged_map_timestamp = msg.header.stamp
+
+        self.merged_map_info = msg.info
+        merged_map_resolution = resolution = self.merged_map_info.resolution
+        merged_map_origin_x = self.merged_map_info.origin.position.x
+        merged_map_origin_y = self.merged_map_info.origin.position.y
+        merged_map_origin_theta = self.quaternion_to_theta(self.merged_map_info.origin.orientation)
+        
+        flat_arr = msg.data
+        self.merged_map = np.reshape(flat_arr, (self.merged_map_info.height, self.merged_map_info.width))
+
 
 
     def unpack_map_msg(self, map_msg):
