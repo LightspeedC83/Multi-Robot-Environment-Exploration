@@ -24,12 +24,12 @@ from rclpy.signals import SignalHandlerOptions
 from nav_msgs.msg import OccupancyGrid # message type for occupancyGrid
 from  nav_msgs.msg import MapMetaData # for the slam_map msg.info
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray, Point, Quaternion # for the ifnromation stored in slam_map msg.info
-from tf2_ros import TransformListener, Buffer
-from std_msgs.msg import Bool # for id_active publisher
+from std_msgs.msg import Bool, Int32 # for id_active publisher
+
 
 # importing custom services
 from mapper_interfaces.srv import GetUniqueID
-
+from mapper_interfaces.srv import GetNewFrontierPath
 
 ## Constants ##
 NEIGHBOR_LIST = [  # list of relative neighbors to a node
@@ -87,6 +87,12 @@ class Coordinator(Node):
         ## setting up unique ID service ##
         self.srv = self.create_service(GetUniqueID, 'get_unique_id', self.handle_id_request)
         self.global_id = 0  # define a global ID tracker (current global id is the most recent id assigned)
+
+        ## setting up a path generation service ##
+        self.srv = self.create_service(GetNewFrontierPath, 'get_path', self.handle_path_request)
+
+        ## setting up new_robot_id topic
+        self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id")
     
     def handle_id_request(self, request, response):
         """This is the callback function to handle the server side of the GetUniqueID service"""
@@ -101,8 +107,40 @@ class Coordinator(Node):
         self.setup_listeners(self.global_id)
         self.setup_publishers(self.global_id)
 
+        # publishing the new id to the /new_robot_id topic
+        new_id_msg = Int32()
+        new_id_msg.data = self.global_id
+        self.new_robot_id_publisher.publish(new_id_msg)
+        
         return response
     
+    def handle_path_request(self, request, response):
+        """this function callback handles the server side of the GetNewFrontierPath Service"""
+        # getting request data
+        self.get_logger().info(f"received path generation request from {request.requester_name}")
+        requester_id = request.requester_id
+        
+        #  if id is invalid
+        if requester_id is None:
+            response.success = False
+            response.message = "Requester has no id"
+            self.get_logger().warn("received path request from robot with no ID")
+            return response
+
+        # generating path
+        result = self.single_robot_plan(requester_id)
+
+        # sending response
+        if result == False:
+            response.success = False 
+            response.message = "No path able to be found to goal frontier node"
+        else:
+            response.success = True 
+            response.message = f"path to next frontier in nav_path_{requester_id}"
+        
+        return response
+
+
 
     def _wait_for_sim_ready(self, timeout_sec):
         """Wait until simulation clock and cmd_vel subscriber are ready."""
@@ -129,7 +167,7 @@ class Coordinator(Node):
     def setup_publishers(self, robot_id):
         """setus up all the publishers for this robot"""
         # path publisher
-        path_publisher = self.create_publisher(PoseArray, f"nav_paths_{robot_id}")
+        path_publisher = self.create_publisher(PoseArray, f"nav_path_{robot_id}")
         self.path_publishers_dictionary[robot_id] = path_publisher
 
 
@@ -163,7 +201,7 @@ class Coordinator(Node):
             if self.ids_active[id]:
                 num_active_robots+=1
         self.num_active_robots = num_active_robots
-        
+
 
     def unpack_map_msg(self, map_msg):
         """ returns a occupancy grid (2D array), resolution, x_occupancy_grid_origin, y_occupancy_grid_origin, origin_rotation, map_width, map_height, timestamp """
@@ -236,7 +274,7 @@ class Coordinator(Node):
 
     ### Code For Path Planning per robot ###
     def single_robot_plan(self, robot_id):
-        """broadcasts plans for frontier exploraiton of a single robot"""
+        """broadcasts plans for frontier exploraiton of a single robot, returns true if path was broadcasted, false if no path found"""
 
         # first get the most recent SLAM Map for this robot
         map, grid_res, x_grid_origin, y_grid_origin, theta_grid_origin, map_width, map_height, map_timestamp = self.unpack_map_msg(self.map_msgs[robot_id])
@@ -249,7 +287,9 @@ class Coordinator(Node):
 
         # find the path to the best frontier point in cell coords
         path_cell = self.get_frontier_path(map, x_map, y_map, map_width, map_height, grid_res)
-
+        if path_cell is None: 
+            return False
+        
         # convert the path to this robot's odom coordinates
         path_odom = [self.cell_to_odom(pt[0], pt[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res) for pt in path_cell] 
 
@@ -269,6 +309,7 @@ class Coordinator(Node):
         # now publish
         pose_pub = self.path_publishers_dictionary[robot_id]
         pose_pub.publish(pose_arr_msg)
+        return True
 
 
     def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell):
@@ -292,7 +333,7 @@ class Coordinator(Node):
         obstacle_avoidance_search_map[free_cells] = smoothed_SLAM_map[free_cells]
 
         # self.get_logger().info(obstacle_avoidance_search_map)
-        np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
+        # np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
         start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map) # snap to nearest free space as start point
 
@@ -352,13 +393,12 @@ class Coordinator(Node):
         else:# if found, we can backtrack from the goal node to the start to get the path
             a_star_node_path = [goal_node]
             while True:
-                a_star_node_path.insert(0, a_star_node_path[0].parent)
-                if a_star_node_path[0].name == "root":
+                if a_star_node_path[0].name == "root": # break before we add the root node, which is the start point, the point the robot is already on
                     break
-            
+                a_star_node_path.insert(0, a_star_node_path[0].parent)
+                
             a_star_path = [(n.x,n.y) for n in a_star_node_path] # we want a list of just the point values
             return a_star_path
-
 
 
     def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height):
@@ -405,6 +445,19 @@ class Coordinator(Node):
         """returns euclidean distance between 2 points (x,y) tuple"""
         return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
     
+    def get_nearest_free_cell(self, x, y, search_map):
+        """Returns nearest free cell to inputted point, searching outward in a spiral"""
+        for radius in range(0, search_map.shape[0]):
+            for dx in range(-radius, radius+1):
+                for dy in range(-radius, radius+1):
+                    if abs(dx) != radius and abs(dy) != radius:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if (0 <= nx < self.SLAM_MAP_SIZE_X and 
+                        0 <= ny < self.SLAM_MAP_SIZE_Y and
+                        0 <= search_map[ny][nx] <= MAP_CLEAR_THRESHOLD):
+                        return nx, ny
+        return x, y  
 
     def is_frontier_cell(self, map, x, y):
         """returns true if the inputted point is free space on SLAM map and next to -1"""
