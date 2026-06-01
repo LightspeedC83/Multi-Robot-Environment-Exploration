@@ -72,6 +72,10 @@ class TargetLocalizer(Node):
         self.declare_parameter("min_pixel_diameter", 3.0)
         self.declare_parameter("max_range_m", 10.0)
         self.declare_parameter("lidar_window_deg", 2.0)
+        self.declare_parameter("prefer_lidar_range", True)
+        self.declare_parameter("min_lidar_target_range_m", 0.30)
+        self.declare_parameter("lidar_vision_tolerance_m", 0.75)
+        self.declare_parameter("lidar_vision_tolerance_ratio", 0.45)
         self.declare_parameter("log_throttle_sec", 1.0)
 
         self.centroid_topic = self.get_parameter("centroid_topic").value
@@ -89,6 +93,10 @@ class TargetLocalizer(Node):
         self.min_pixel_diameter = float(self.get_parameter("min_pixel_diameter").value)
         self.max_range_m = float(self.get_parameter("max_range_m").value)
         self.lidar_window_deg = float(self.get_parameter("lidar_window_deg").value)
+        self.prefer_lidar_range = bool(self.get_parameter("prefer_lidar_range").value)
+        self.min_lidar_target_range_m = float(self.get_parameter("min_lidar_target_range_m").value)
+        self.lidar_vision_tolerance_m = float(self.get_parameter("lidar_vision_tolerance_m").value)
+        self.lidar_vision_tolerance_ratio = float(self.get_parameter("lidar_vision_tolerance_ratio").value)
         self.log_throttle_sec = float(self.get_parameter("log_throttle_sec").value)
 
         self.camera_info = None
@@ -153,20 +161,22 @@ class TargetLocalizer(Node):
         v = float(msg.point.y)
         pixel_diameter = float(msg.point.z)
 
-        depth = self.estimate_depth(pixel_diameter, fx, fy)
-        if depth is None:
+        vision_depth = self.estimate_depth(pixel_diameter, fx, fy)
+        if vision_depth is None:
             return
 
-        # Back-project the image centroid into the camera frame using the pinhole
-        # camera model. Depth comes from the known-size target assumption.
-        point_camera = PointStamped()
-        point_camera.header.stamp = msg.header.stamp
-        point_camera.header.frame_id = self.resolve_camera_frame(msg)
-        point_camera.point.x = (u - cx) * depth / fx
-        point_camera.point.y = (v - cy) * depth / fy
-        point_camera.point.z = depth
-
-        point_odom = self.to_target_frame(point_camera)
+        camera_frame = self.resolve_camera_frame(msg)
+        point_odom, range_text = self.localize_target(
+            msg.header.stamp,
+            camera_frame,
+            u,
+            v,
+            cx,
+            cy,
+            fx,
+            fy,
+            vision_depth,
+        )
         if point_odom is None:
             return
 
@@ -178,19 +188,103 @@ class TargetLocalizer(Node):
         self.point_publisher.publish(point_odom)
         self.pose_publisher.publish(pose_odom)
 
-        lidar_text = self.describe_lidar_measurement(point_odom)
-
         self.get_logger().info(
             f"{self.event_label}: "
             f"{self.target_frame}=("
             f"x={point_odom.point.x:.2f}, "
             f"y={point_odom.point.y:.2f}, "
             f"z={point_odom.point.z:.2f}), "
-            f"range={depth:.2f} m, "
+            f"{range_text}, "
             f"image_centroid=({u:.1f},{v:.1f}) px, "
-            f"{lidar_text}",
+            f"vision_planar_range={vision_depth:.2f} m",
             throttle_duration_sec=self.log_throttle_sec,
         )
+
+    def localize_target(self, stamp, camera_frame, u, v, cx, cy, fx, fy, vision_depth):
+        """Return target point in odom, preferring the lidar beam at the centroid bearing."""
+        lidar_reject_text = ""
+        if self.prefer_lidar_range:
+            lidar_result = self.lidar_point_from_centroid_bearing(
+                stamp,
+                camera_frame,
+                u,
+                v,
+                cx,
+                cy,
+                fx,
+                fy,
+                vision_depth,
+            )
+            if lidar_result is not None:
+                lidar_point, beam_range, bearing = lidar_result
+                point_odom = self.to_target_frame(lidar_point)
+                if point_odom is not None and self.lidar_matches_vision(beam_range, vision_depth):
+                    planar_range = math.hypot(lidar_point.point.x, lidar_point.point.y)
+                    bearing_deg = math.degrees(math.atan2(lidar_point.point.y, lidar_point.point.x))
+                    return (
+                        point_odom,
+                        f"range={planar_range:.2f} m, lidar={planar_range:.2f} m near {bearing_deg:.1f} deg",
+                    )
+                lidar_reject_text = (
+                    f", lidar=rejected_{beam_range:.2f}m_at_{math.degrees(bearing):.1f}deg"
+                )
+
+        # Fallback: use the original visual size estimate when lidar is not available.
+        point_camera = PointStamped()
+        point_camera.header.stamp = stamp
+        point_camera.header.frame_id = camera_frame
+        point_camera.point.x = (u - cx) * vision_depth / fx
+        point_camera.point.y = (v - cy) * vision_depth / fy
+        point_camera.point.z = vision_depth
+
+        point_odom = self.to_target_frame(point_camera)
+        if point_odom is None:
+            return None, ""
+
+        return point_odom, f"range={vision_depth:.2f} m, lidar=fallback_to_vision{lidar_reject_text}"
+
+    def lidar_point_from_centroid_bearing(self, stamp, camera_frame, u, v, cx, cy, fx, fy, vision_depth):
+        """Map image centroid to lidar bearing and use the lidar range directly."""
+        if self.latest_scan is None:
+            return None
+
+        scan_frame = self.lidar_frame_parameter or self.latest_scan.header.frame_id
+        if not scan_frame:
+            return None
+
+        #  bearing finding: camera direction giving, lidar distance taking.
+        ray_depth = max(vision_depth, self.assumed_depth_m, 0.5)
+        point_camera = PointStamped()
+        point_camera.header.stamp = stamp
+        point_camera.header.frame_id = camera_frame
+        point_camera.point.x = (u - cx) * ray_depth / fx
+        point_camera.point.y = (v - cy) * ray_depth / fy
+        point_camera.point.z = ray_depth
+
+        point_scan = self.to_frame(point_camera, scan_frame)
+        if point_scan is None:
+            return None
+
+        bearing = math.atan2(point_scan.point.y, point_scan.point.x)
+        beam_range = self.pick_lidar_beam_by_bearing(self.latest_scan, bearing)
+        if beam_range is None:
+            return None
+
+        lidar_point = PointStamped()
+        lidar_point.header.stamp = stamp
+        lidar_point.header.frame_id = scan_frame
+        lidar_point.point.x = beam_range * math.cos(bearing)
+        lidar_point.point.y = beam_range * math.sin(bearing)
+        lidar_point.point.z = 0.0
+        return lidar_point, beam_range, bearing
+
+    def lidar_matches_vision(self, lidar_range, vision_depth):
+        #  obstacle rejection: lidar agreeing, or vision gets the final say.
+        tolerance = max(
+            self.lidar_vision_tolerance_m,
+            self.lidar_vision_tolerance_ratio * max(vision_depth, 0.0),
+        )
+        return abs(lidar_range - vision_depth) <= tolerance
 
     def estimate_depth(self, pixel_diameter, fx, fy):
         if pixel_diameter >= self.min_pixel_diameter:
@@ -302,6 +396,38 @@ class TargetLocalizer(Node):
 
         # this picks the beam most consistent with the CV estimate, not just the closest wall
         return min(candidates, key=lambda value: abs(value - expected_range))
+
+    def pick_lidar_beam_by_bearing(self, scan, bearing):
+        """Pick the valid lidar beam closest to the centroid bearing."""
+        if scan.angle_increment == 0.0 or not scan.ranges:
+            return None
+
+        center = int(round((bearing - scan.angle_min) / scan.angle_increment))
+        if center < 0 or center >= len(scan.ranges):
+            return None
+
+        window = max(
+            0,
+            int(round(math.radians(self.lidar_window_deg) / abs(scan.angle_increment))),
+        )
+        lo = max(0, center - window)
+        hi = min(len(scan.ranges), center + window + 1)
+
+        best = None
+        for index in range(lo, hi):
+            value = scan.ranges[index]
+            if (
+                math.isfinite(value)
+                and value >= scan.range_min
+                and value >= self.min_lidar_target_range_m
+                and value <= scan.range_max
+                and value <= self.max_range_m
+            ):
+                angular_error = abs(index - center)
+                if best is None or angular_error < best[0]:
+                    best = (angular_error, float(value))
+
+        return None if best is None else best[1]
 
     def to_frame(self, point, frame_id):
         if point.header.frame_id == frame_id:

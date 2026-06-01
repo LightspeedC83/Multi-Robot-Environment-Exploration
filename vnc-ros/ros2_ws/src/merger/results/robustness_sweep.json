@@ -1,0 +1,102 @@
+[
+  {
+    "theta_gt_deg": 0,
+    "theta_recovered_deg": -0.620619936411254,
+    "angle_error_deg": 0.620619936411254,
+    "inliers": 14,
+    "wall_agreement": 0.7376916868442293,
+    "overlap_ratio": 0.8302683236414087,
+    "confidence": 0.6367676298763676,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 3,
+    "theta_recovered_deg": -3.072521681281248,
+    "angle_error_deg": 0.07252168128124792,
+    "inliers": 19,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8391581557352854,
+    "confidence": 0.7802453753539424,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 7,
+    "theta_recovered_deg": -7.057631082912413,
+    "angle_error_deg": 0.0576310829124127,
+    "inliers": 12,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8435719557195572,
+    "confidence": 0.6694329500821695,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 10,
+    "theta_recovered_deg": -9.911809050098078,
+    "angle_error_deg": 0.08819094990192156,
+    "inliers": 17,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8446484444182065,
+    "confidence": 0.7518472981024874,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 15,
+    "theta_recovered_deg": -14.88496127204859,
+    "angle_error_deg": 0.11503872795140957,
+    "inliers": 19,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8404569337032882,
+    "confidence": 0.7802453753539424,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 20,
+    "theta_recovered_deg": -20.05018343655363,
+    "angle_error_deg": 0.05018343655363111,
+    "inliers": 21,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8531048231128566,
+    "confidence": 0.8067143230122719,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 30,
+    "theta_recovered_deg": -29.970328837231502,
+    "angle_error_deg": 0.029671162768497794,
+    "inliers": 12,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8836469652796184,
+    "confidence": 0.6694329500821695,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 45,
+    "theta_recovered_deg": -45.35364184010034,
+    "angle_error_deg": 0.3536418401003374,
+    "inliers": 16,
+    "wall_agreement": 0.22746331236897274,
+    "overlap_ratio": 0.9241735341479587,
+    "confidence": 0.4497699646465935,
+    "success": false
+  },
+  {
+    "theta_gt_deg": 60,
+    "theta_recovered_deg": -59.90315777630017,
+    "angle_error_deg": 0.09684222369983075,
+    "inliers": 22,
+    "wall_agreement": 1.0,
+    "overlap_ratio": 0.8568812379818698,
+    "confidence": 0.8193212706006459,
+    "success": true
+  },
+  {
+    "theta_gt_deg": 90,
+    "theta_recovered_deg": NaN,
+    "angle_error_deg": NaN,
+    "inliers": 0,
+    "wall_agreement": 0.0,
+    "overlap_ratio": 0.0,
+    "confidence": 0.0,
+    "success": false
+  }
+]

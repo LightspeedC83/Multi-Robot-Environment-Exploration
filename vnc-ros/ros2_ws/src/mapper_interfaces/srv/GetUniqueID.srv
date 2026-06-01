@@ -1,0 +1,9 @@
+# This file is defining a service where the requester queries it, and receives as a unique ID
+
+# request  goes on this sie of the --- (response on the other side)
+
+string requester_name
+---
+int32 id
+bool success
+string message

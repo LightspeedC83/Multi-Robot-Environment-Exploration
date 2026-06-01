@@ -1,70 +1,101 @@
-# Author: Charles Lowney 
-# Date: 5/10/26
+# mapper
 
-# Final project mapper(CS81)
+Mapping, local control, and planning/coordinator package for the multi-robot demo.
 
-## Description
-This code has a robot map its environment, generating and publishing occupancyGrid data that it creates
+## Nodes
 
+`mapper.py` runs once per robot. It:
 
-## How to execute 
+- builds a local occupancy grid from LiDAR scans,
+- publishes `/SLAM_map_<id>` and `/pose_<id>`,
+- follows coordinator paths from `/nav_path_<id>`,
+- performs local obstacle/stall recovery,
+- stops on `/mission_complete`.
 
-In one terminal from ros2_ws\src:
-```bash
-docker compose up
+`coordinator.py` runs once globally. It:
+
+- assigns robot IDs through `/get_unique_id`,
+- subscribes to each robot map, pose, heuristic point, and goal point,
+- chooses frontier paths while the goal is unknown,
+- switches both robots to goal-directed paths once the goal is seen,
+- publishes the final goal-to-start path on `/final_goal_to_start_path`,
+- publishes `/mission_complete` and zero velocity commands when the answer is ready.
+
+## Behavior
+
+- Unknown goal: robots explore frontier cells ranked by distance plus simulated raycast information gain, with heuristic bottle detections as soft search bias.
+- Goal seen: heuristic bias is disabled, and both robots receive goal-directed plans.
+- Obstacle/stall recovery: mappers back up, turn, and replan when motion stalls near obstacles.
+- Path following: each mapper clips new paths to the nearest remaining waypoint before driving.
+- Final answer: the coordinator chooses the shortest available path from the detected goal to a robot starting pose.
+
+## Mapping
+
+`PROBABILISTIC_MAPPING = True` enables log-odds occupancy updates. Published occupancy-grid values are:
+
+- `-1`: unknown,
+- `0`: likely free,
+- `1-99`: probabilistic occupancy belief,
+- `100`: occupied.
+
+This is an obstacle/map belief. It is not a target-belief map.
+
+## Topics
+
+Mapper output:
+
+```text
+/SLAM_map_<id>
+/pose_<id>
+/id_active_<id>
 ```
 
-if docker had completely reset previously, and you need to install dependancies, run the following:
-```bash
-bash install_stage.sh && source ../install/setup.bash
-apt update
-apt install -y python3-pip
-pip3 install anytree
+Coordinator output:
+
+```text
+/nav_path_<id>
+/final_goal_to_start_path
+/mission_complete
 ```
 
-in another terminal:
-```bash
-docker compose exec ros bash
-ros2 launch stage_ros2 stage.launch.py world:=/root/ros2_ws/src/mapper/maze enforce_prefixes:=false one_tf_tree:=true
+CV inputs consumed by the coordinator:
+
+```text
+/robot1/heuristic_point_odom
+/robot1/goal_point_odom
+/robot2/heuristic_point_odom
+/robot2/goal_point_odom
 ```
 
+## Services
 
-in another terminal:
-```bash
-docker compose exec ros bash
-python3 mapper/mapper.py
+```text
+/get_unique_id        mapper_interfaces/srv/GetUniqueID
+/get_path             mapper_interfaces/srv/GetNewFrontierPath
 ```
 
-go to http://localhost:8080/vnc.html to see simulation
+## Run In Integrated Demo
 
+Use the project launch rather than starting mapper/coordinator manually:
 
-if you don't have the following line in the bash.rc file, you need to run this line every time you open a new ros2 terminal:
 ```bash
+cd /root/ros2_ws
 source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-## Visualizing the Map in rviz2
-ensure that the PA4.py code is running (see above section)
+For map evidence:
 
-in a separate terminal:
 ```bash
-docker compose exec ros bash
-rviz2
+rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
 ```
 
-Go to http://localhost:8080/vnc.html and you should see the rviz2 window. 
+Useful checks:
 
-Click "Add" in the bottom left of the rviz2 screen
-Select "By topic" in the display that pops up
-Under "/SLAM_map" select "Map"
-Hit "OK"
-
-You may now need to restart the PA4 code or set fixed frame to "rosbot/odom"
-
-## implementation of probabilistic mapping
-Normal operation has following values in the occupancy grid:
-- Unknown (-1): Unexplored regions.
-- Freespace (0): Cells along the ray that are clear of obstacles.
-- Occupied (100): Cells where a laser "hit" was recorded.
-
-When `PROBABILISTIC_MAPPING` is False, the robot operates in normal mode, as outlined above. But when `PROBABILISTIC_MAPPING` is True, the robot implements a recursive Bayesian update using log-odds to make the map resilient to sensor noise. Where the value in the grid falls in a range from 0 to 100, and reprensents the probability (percent) that the cell is occupied. A value of -1 still means that the cell has not been explored.  
+```bash
+ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
+ros2 topic echo --qos-durability transient_local --once /final_goal_to_start_path
+ros2 topic echo --once /mission_complete
+```
