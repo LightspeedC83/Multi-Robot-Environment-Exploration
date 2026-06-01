@@ -78,11 +78,32 @@ Change the threshold at runtime, e.g.:
 ```bash
 ros2 param set /map_coordinator confidence_threshold 0.7
 
+## Run the Code
 
-## Run the code
-
-docker compose up
+### Step 1: Start the container
+Navigate to the `vnc-ros` folder on your Windows machine and run:
+cmd
+cd path\to\vnc-ros
+docker compose up -d
 docker compose exec ros bash
+
+
+### Step 2: Source ROS 2
+Inside the container:
+bash
 source /opt/ros/humble/setup.bash
-source /ros_ws/install/setup.bash
-ros2 run <your_package_name> map_merger_node
+
+### Step 3: Build the package
+bash
+cd /root/ros2_ws
+colcon build --packages-select merger
+source install/setup.bash
+
+
+### Step 4: Run the node
+bash
+ros2 run merger map_merger_node
+
+
+You should see:
+[INFO] [map_coordinator]: map_coordinator ready, waiting for robots to register, confidence_threshold=0.5
