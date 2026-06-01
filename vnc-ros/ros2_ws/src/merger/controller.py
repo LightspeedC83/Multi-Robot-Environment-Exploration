@@ -35,14 +35,15 @@ import map_coordinator as mc
 
 # Constants
 
-DEFAULT_MERGED_MAP_TOPIC   = '/merged_map'
+DEFAULT_MERGED_MAP_TOPIC   = 'merged_map'
 DEFAULT_CONFIDENCE_THRESH  = 0.5
 TRANSFORM_RETRY_CELLS      = 500   # try to realign after this many new known cells
 MIN_CELLS_BEFORE_FIRST_TRY = 1000  # don't bother before either robot has seen this much
 
 # Time in seconds between coordination passes when no per-robot trigger fires.
 COORDINATION_PERIOD_SEC = 5.0
-
+MAP_SUBTOPIC = 'SLAM_map'
+ANCHOR_ROBOT_ID = 'robot1'
 
 # Helpers
 
@@ -93,7 +94,7 @@ def numpy_to_occupancy_grid_msg(grid, resolution, origin_x, origin_y,
 # Per-robot state held by the coordinator
 
 class RobotMapState:
-    """Tracks the latest map and bookkeeping for one robot."""
+    #Tracks the latest map and bookkeeping for one robot
 
     def __init__(self, robot_id: str):
         self.robot_id = robot_id
@@ -124,51 +125,45 @@ class RobotMapState:
 # The node
 
 def build_node():
-    """Construct the MapCoordinatorNode class. Done inside a function so the
-    rclpy import is deferred until main() runs.
-    """
+    #Construct the MapCoordinatorNode class. Done inside a function so the
+    #rclpy import is deferred until main() runs.
+
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
     from nav_msgs.msg import OccupancyGrid
     from geometry_msgs.msg import TransformStamped
     from tf2_ros import StaticTransformBroadcaster
+    from std_msgs.msg import Int32
 
     class MapCoordinatorNode(Node):
-        def __init__(self, robot_ids):
+        def __init__(self):
             super().__init__('map_coordinator')
 
-            self.declare_parameter('confidence_threshold',
-                                   DEFAULT_CONFIDENCE_THRESH)
-            self.confidence_threshold = float(
-                self.get_parameter('confidence_threshold').value
-            )
+            self.declare_parameter('confidence_threshold', DEFAULT_CONFIDENCE_THRESH)
+            self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
 
-            self.robot_states: Dict[str, RobotMapState] = {
-                rid: RobotMapState(rid) for rid in robot_ids
-            }
+            self.robot_states: Dict[str, RobotMapState] = {}
             # Currently-known transforms between robot odom frames. Key:
             # (anchor_id, follower_id). Value: 2x3 affine in grid coords plus
             # the resolution it was solved at.
             self.known_transforms: Dict[Tuple[str, str], dict] = {}
+            self._map_subs = {} # robot_id -> subscription object
 
             qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1,
             )
+            self._qos = qos
 
-            # One subscriber per robot. Topics follow mapper.py's pattern:
-            # /<robot_id>/SLAM_map.
-            self._subs = []
-            for rid in robot_ids:
-                topic = f'/{rid}/map'
-                self.get_logger().info(f'subscribing to {topic}')
-                sub = self.create_subscription(
-                    OccupancyGrid, topic,
-                    self._make_map_callback(rid), qos,
-                )
-                self._subs.append(sub)
+            # Listen for new robot registrations from controller node in mapper
+            self._new_robot_sub = self.create_subscription(
+                Int32,
+                '/new_robot_id',
+                self._on_new_robot_registered,
+                10,
+            )
 
             # Publishers / broadcasters.
             self._merged_pub = self.create_publisher(
@@ -182,12 +177,38 @@ def build_node():
                 COORDINATION_PERIOD_SEC, self._coordination_pass,
             )
 
-            self.get_logger().info(
-                f'map_coordinator ready, robots={list(robot_ids)}, '
-                f'confidence_threshold={self.confidence_threshold}'
-            )
+            self.get_logger().info(f'map_coordinator ready, waiting for robots to register, 'f'confidence_threshold={self.confidence_threshold}')
 
         # Subscribers
+        def _on_new_robot_registered(self, msg: Int32):
+            #Called when mapper coordinator assigns a new integer ID to a robot
+            integer_id = msg.data
+            robot_id = f'robot{integer_id}' # convert int 1 -> string 'robot1'
+
+            if robot_id in self.robot_states:
+                self.get_logger().warn(f'{robot_id} already registered, ignoring.')
+                return
+
+            # Add state tracker for this robot
+            self.robot_states[robot_id] = RobotMapState(robot_id)
+
+            # Subscribe to this robot's map topic  e.g. /robot1/map
+            topic = f'/{robot_id}/{MAP_SUBTOPIC}'
+            self.get_logger().info(f'New robot registered: {robot_id}, subscribing to {topic}')
+
+            sub = self.create_subscription(
+                OccupancyGrid,
+                topic,
+                self._make_map_callback(robot_id),
+                self._qos,
+            )
+            self._map_subs[robot_id] = sub      # hold reference to prevent GC
+
+            self.get_logger().info(
+                f'Now tracking {len(self.robot_states)} robot(s): '
+                f'{list(self.robot_states.keys())}'
+            )
+
 
         def _make_map_callback(self, robot_id):
             def cb(msg):
@@ -211,12 +232,11 @@ def build_node():
             # Robot 1 is always the anchor when it participates, so the merged
             # map ends up in the odom_1 frame
             pairs = []
-            if "1" in ready:
+            if ANCHOR_ROBOT_ID in ready:
                 for other in ready:
-                    if other != "1":
-                        pairs.append(("1", other))
+                    if other != ANCHOR_ROBOT_ID:
+                        pairs.append((ANCHOR_ROBOT_ID, other))
             else:
-                # Robot 1 not online yet; fall back to pairing the others.
                 for i, a in enumerate(ready):
                     for b in ready[i + 1:]:
                         pairs.append((a, b))
@@ -295,23 +315,22 @@ def build_node():
                 resolution=anchor.resolution,
                 origin_x=new_origin_x,
                 origin_y=new_origin_y,
-                frame_id=f'robot1/odom',
+                frame_id=f'{anchor_id}/odom',
                 stamp=self.get_clock().now().to_msg(),
             )
             self._merged_pub.publish(msg)
 
         def _broadcast_tf(self, anchor_id, follower_id, result):
-            """Publish a static TF putting follower's odom frame inside
-            anchor's odom frame.
+            #Publish a static TF putting follower's odom frame inside anchor's odom frame.
 
-            The transform we have is in grid (cell) coordinates and includes
-            the canvas offsets used during fusion. To recover the pure odom
-            -> odom transform we need only the rotation + the metric
-            translation between the two map origins. We already computed
-            transform_meters for the metric (tx, ty, theta) that maps cells
-            in B to cells in A; combined with the resolution and the two
-            grids' origin offsets it becomes the inter-odom transform.
-            """
+            # The transform we have is in grid (cell) coordinates and includes
+            # the canvas offsets used during fusion. To recover the pure odom
+            # -> odom transform we need only the rotation + the metric
+            # translation between the two map origins. We already computed
+            # transform_meters for the metric (tx, ty, theta) that maps cells
+            # in B to cells in A; combined with the resolution and the two
+            # grids' origin offsets it becomes the inter-odom transform.
+            
             tm = result['transform_meters']
             if tm is None:
                 return
@@ -332,12 +351,12 @@ def build_node():
             t.transform.translation.z = 0.0
             t.transform.rotation.x = 0.0
             t.transform.rotation.y = 0.0
-            t.transform.rotation.z = math.sin(theta / 2.0)
-            t.transform.rotation.w = math.cos(theta / 2.0)
+            t.transform.rotation.z = math.sin(theta/2.0)
+            t.transform.rotation.w = math.cos(theta/2.0)
 
             self._tf_broadcaster.sendTransform(t)
             self.get_logger().info(
-                f'broadcasted static TF odom_{anchor_id} <- odom_{follower_id} '
+                f'broadcasted static TF {anchor_id}/odom <- {follower_id}/odom '
                 f'(tx={tx:.3f}m, ty={ty:.3f}m, theta={math.degrees(theta):.2f}deg)'
             )
 
@@ -345,20 +364,12 @@ def build_node():
 
 
 def main():
-    import argparse
     import rclpy
     from rclpy.signals import SignalHandlerOptions
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--robots', nargs='+', default=['robot1', 'robot2'],
-        help='IDs of the robots whose maps this coordinator will fuse',
-    )
-    args, ros_args = parser.parse_known_args()
-
-    rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     NodeCls = build_node()
-    node = NodeCls(args.robots)
+    node = NodeCls()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
