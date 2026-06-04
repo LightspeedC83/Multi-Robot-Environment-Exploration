@@ -129,3 +129,14 @@ Useful debug topics:
 /robot1/heuristic_debug_image
 /robot2/heuristic_debug_image
 ```
+
+## Report Visuals
+
+After the final path is saved, generate clean report figures:
+
+```bash
+python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
+  --results-dir /root/ros2_ws/src/final_path_results
+```
+
+The output folder is `/root/ros2_ws/src/final_path_results/report_visuals/` and includes the final result panel, waypoint trace, system-flow diagram, topic-flow diagram, behavior timeline, and a small visual index.

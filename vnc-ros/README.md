@@ -152,6 +152,26 @@ final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start
 Mission complete received; stopping exploration
 ```
 
+## Report Visuals
+
+After a successful demo run, generate report-ready diagrams from the saved final path artifacts:
+
+```bash
+python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
+  --results-dir /root/ros2_ws/src/final_path_results
+```
+
+Generated files:
+
+```text
+/root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_behavior_timeline.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_visual_index.md
+```
+
 ## Behavior Summary
 
 - Robots explore frontiers while the goal is unknown.

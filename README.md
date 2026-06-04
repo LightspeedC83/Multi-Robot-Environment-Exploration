@@ -128,6 +128,24 @@ Final report artifacts:
 /root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
 ```
 
+Generate polished report visuals from those artifacts:
+
+```bash
+python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
+  --results-dir /root/ros2_ws/src/final_path_results
+```
+
+This creates:
+
+```text
+/root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_behavior_timeline.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_visual_index.md
+```
+
 ## Packages
 
 - `final_project_cv`: Gazebo world, camera target detection, target localization, RViz config, integrated launch.
