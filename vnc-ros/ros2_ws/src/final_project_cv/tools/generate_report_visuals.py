@@ -6,9 +6,8 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import textwrap
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import cv2
@@ -82,6 +81,12 @@ def write_text(
     color: Color = INK,
     thickness: int = 1,
 ) -> int:
+    (_width, text_height), baseline = cv2.getTextSize(
+        text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        thickness,
+    )
     cv2.putText(
         image,
         text,
@@ -92,7 +97,63 @@ def write_text(
         thickness,
         cv2.LINE_AA,
     )
-    return y + int(28 * scale) + 8
+    return y + text_height + baseline + 8
+
+
+def text_width(text: str, scale: float, thickness: int = 1) -> int:
+    return cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+
+
+def text_step(scale: float, thickness: int = 1, line_gap: int = 10) -> int:
+    (_width, text_height), baseline = cv2.getTextSize(
+        "Ag",
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        thickness,
+    )
+    return text_height + baseline + line_gap
+
+
+def split_long_token(token: str, max_width_px: int, scale: float, thickness: int = 1) -> List[str]:
+    if text_width(token, scale, thickness) <= max_width_px:
+        return [token]
+
+    pieces: List[str] = []
+    current = ""
+    for char in token:
+        candidate = current + char
+        if current and text_width(candidate, scale, thickness) > max_width_px:
+            pieces.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def wrap_pixels(text: str, max_width_px: int, scale: float, thickness: int = 1) -> List[str]:
+    lines: List[str] = []
+    for paragraph in text.splitlines() or [""]:
+        if not paragraph.strip():
+            lines.append("")
+            continue
+
+        current = ""
+        tokens: List[str] = []
+        for token in paragraph.split(" "):
+            tokens.extend(split_long_token(token, max_width_px, scale, thickness))
+
+        for token in tokens:
+            candidate = token if not current else f"{current} {token}"
+            if current and text_width(candidate, scale, thickness) > max_width_px:
+                lines.append(current)
+                current = token
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+    return lines
 
 
 def wrapped_text(
@@ -105,14 +166,62 @@ def wrapped_text(
     color: Color = INK,
     line_gap: int = 10,
 ) -> int:
-    for paragraph in text.splitlines() or [""]:
-        if not paragraph.strip():
-            y += int(24 * scale)
+    max_width_px = max(80, int(width_chars * 10))
+    for line in wrap_pixels(text, max_width_px, scale):
+        if not line:
+            y += text_step(scale, line_gap=line_gap)
             continue
-        for line in textwrap.wrap(paragraph, width=width_chars) or [""]:
-            y = write_text(image, line, x, y, scale=scale, color=color)
-            y += line_gap
+        y = write_text(image, line, x, y, scale=scale, color=color)
+        y += line_gap
     return y
+
+
+def draw_text_box(
+    image: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    scale: float = 0.56,
+    color: Color = INK,
+    thickness: int = 1,
+    min_scale: float = 0.38,
+) -> int:
+    """Draw wrapped text and shrink slightly if the box is too full."""
+    scale_now = scale
+    while scale_now >= min_scale:
+        lines = wrap_pixels(text, w, scale_now, thickness)
+        step = text_step(scale_now, thickness=thickness, line_gap=9)
+        if max(1, len(lines)) * step <= h:
+            break
+        scale_now -= 0.04
+
+    lines = wrap_pixels(text, w, scale_now, thickness)
+    step = text_step(scale_now, thickness=thickness, line_gap=9)
+    max_lines = max(1, h // step)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        if lines:
+            while lines[-1] and text_width(lines[-1] + "...", scale_now, thickness) > w:
+                lines[-1] = lines[-1][:-1]
+            lines[-1] = (lines[-1].rstrip() + "...").strip()
+
+    cursor_y = y
+    for line in lines:
+        if line:
+            cv2.putText(
+                image,
+                line,
+                (x, cursor_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scale_now,
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+        cursor_y += step
+    return cursor_y
 
 
 def card(image: np.ndarray, x: int, y: int, w: int, h: int, title: str = "") -> None:
@@ -132,6 +241,101 @@ def resize_to_fit(image: np.ndarray, max_w: int, max_h: int) -> np.ndarray:
 def paste(base: np.ndarray, image: np.ndarray, x: int, y: int) -> None:
     h, w = image.shape[:2]
     base[y : y + h, x : x + w] = image
+
+
+def find_optional_image(results_dir: Path, filename: str) -> Optional[np.ndarray]:
+    candidates = [
+        results_dir / "snapshots" / filename,
+        results_dir / "report_inputs" / filename,
+        results_dir / filename,
+    ]
+    for path in candidates:
+        if path.exists():
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is not None:
+                return image
+    return None
+
+
+def tile_image(
+    image: np.ndarray,
+    source: Optional[np.ndarray],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    title: str,
+    caption: str,
+    accent: Color,
+    missing_note: str,
+    crop_source: bool = False,
+) -> None:
+    card(image, x, y, w, h)
+    cv2.rectangle(image, (x, y), (x + w, y + 10), accent, -1)
+    write_text(image, title, x + 22, y + 42, scale=0.62, color=INK, thickness=2)
+
+    image_top = y + 64
+    caption_h = 72
+    image_h = h - 88 - caption_h
+    image_w = w - 44
+    cv2.rectangle(image, (x + 22, image_top), (x + 22 + image_w, image_top + image_h), (238, 239, 237), -1)
+    cv2.rectangle(image, (x + 22, image_top), (x + 22 + image_w, image_top + image_h), LINE, 1)
+
+    if source is not None:
+        if crop_source:
+            source = crop_map_content(source)
+        fitted = resize_to_fit(source, image_w - 8, image_h - 8)
+        fx = x + 22 + (image_w - fitted.shape[1]) // 2
+        fy = image_top + (image_h - fitted.shape[0]) // 2
+        paste(image, fitted, fx, fy)
+    else:
+        cv2.line(image, (x + 44, image_top + 30), (x + image_w, image_top + image_h - 30), (195, 198, 199), 2)
+        cv2.line(image, (x + image_w, image_top + 30), (x + 44, image_top + image_h - 30), (195, 198, 199), 2)
+        draw_text_box(
+            image,
+            missing_note,
+            x + 46,
+            image_top + image_h // 2 - 26,
+            image_w - 48,
+            80,
+            scale=0.50,
+            color=MUTED,
+        )
+
+    draw_text_box(
+        image,
+        caption,
+        x + 22,
+        y + h - caption_h + 16,
+        w - 44,
+        caption_h - 18,
+        scale=0.48,
+        color=MUTED,
+    )
+
+
+def placeholder_note(topic: str) -> str:
+    return f"Run snapshot capture while {topic} is publishing."
+
+
+def crop_map_content(source: np.ndarray, margin: int = 28) -> np.ndarray:
+    """Crop large unknown-map borders while keeping enough context for reports."""
+    if source is None or source.size == 0:
+        return source
+    gray_bg = np.array([170, 170, 170], dtype=np.int16)
+    diff = np.max(np.abs(source.astype(np.int16) - gray_bg), axis=2)
+    mask = diff > 18
+    if not np.any(mask):
+        return source
+
+    ys, xs = np.where(mask)
+    y0 = max(0, int(ys.min()) - margin)
+    y1 = min(source.shape[0], int(ys.max()) + margin + 1)
+    x0 = max(0, int(xs.min()) - margin)
+    x1 = min(source.shape[1], int(xs.max()) + margin + 1)
+    if (y1 - y0) < 20 or (x1 - x0) < 20:
+        return source
+    return source[y0:y1, x0:x1]
 
 
 def parse_robot_id(summary: Dict[str, str]) -> str:
@@ -198,12 +402,13 @@ def build_evidence_panel(
     draw_metric(output, 1232, 304, "Source map", summary.get("map_source", "?"), RED)
 
     card(output, 990, 420, 470, 210, "What this proves")
-    wrapped_text(
+    draw_text_box(
         output,
         "The robots explore with occupancy-grid mapping. The first reliable goal observation becomes the stored target, so both robots stop searching and the coordinator returns the shortest A* path from the best start.",
         1020,
         480,
-        width_chars=45,
+        415,
+        120,
         scale=0.56,
         color=INK,
     )
@@ -300,6 +505,214 @@ def build_waypoint_trace(
     return path
 
 
+def build_cv_detection_evidence(results_dir: Path) -> Path:
+    output = make_canvas(1700, 1060)
+    write_text(output, "Computer Vision Detection Evidence", 44, 58, scale=1.05, thickness=2)
+    draw_text_box(
+        output,
+        "These panels come from the live debug-image topics. They show the camera view and segmentation overlays used to publish goal and heuristic PointStamped detections.",
+        46,
+        96,
+        1280,
+        70,
+        scale=0.56,
+        color=MUTED,
+    )
+
+    missing = "Run capture_report_snapshots.py while the integrated demo is active."
+    tiles = [
+        (
+            "Robot 1 raw camera",
+            "cv_robot1_camera_raw.png",
+            "/robot1/camera/image_raw",
+            "Raw camera frame before detection.",
+            GREEN,
+        ),
+        (
+            "Robot 1 goal segmentation",
+            "cv_robot1_goal_debug.png",
+            "/robot1/goal_debug_image",
+            "Goal detector overlay with bounding box/centroid when the orange sphere is visible.",
+            ORANGE,
+        ),
+        (
+            "Robot 1 heuristic segmentation",
+            "cv_robot1_heuristic_debug.png",
+            "/robot1/heuristic_debug_image",
+            "Heuristic clue overlay for bottle detections before the goal is locked.",
+            BLUE,
+        ),
+        (
+            "Robot 2 raw camera",
+            "cv_robot2_camera_raw.png",
+            "/robot2/camera/image_raw",
+            "Second robot camera stream for independent exploration evidence.",
+            GREEN,
+        ),
+        (
+            "Robot 2 goal segmentation",
+            "cv_robot2_goal_debug.png",
+            "/robot2/goal_debug_image",
+            "Second robot goal detector overlay.",
+            ORANGE,
+        ),
+        (
+            "Robot 2 heuristic segmentation",
+            "cv_robot2_heuristic_debug.png",
+            "/robot2/heuristic_debug_image",
+            "Second robot heuristic detector overlay.",
+            BLUE,
+        ),
+    ]
+    x_positions = [44, 600, 1156]
+    y_positions = [190, 620]
+    for index, (title, filename, topic, caption, accent) in enumerate(tiles):
+        x = x_positions[index % 3]
+        y = y_positions[index // 3]
+        tile_image(
+            output,
+            find_optional_image(results_dir, filename),
+            x,
+            y,
+            500,
+            370,
+            title,
+            f"{topic} | {caption}",
+            accent,
+            missing if filename.endswith("camera_raw.png") else placeholder_note(topic),
+        )
+
+    path = results_dir / "report_visuals" / "report_cv_detection_evidence.png"
+    cv2.imwrite(str(path), output)
+    return path
+
+
+def build_map_progression(
+    results_dir: Path,
+    summary: Dict[str, str],
+    map_image: np.ndarray,
+) -> Path:
+    output = make_canvas(1700, 1060)
+    write_text(output, "Mapping And Final Path Progression", 44, 58, scale=1.05, thickness=2)
+    draw_text_box(
+        output,
+        "This figure shows the evidence chain from individual robot occupancy grids, to the merged/global map when available, to the final A* path returned for the closest start.",
+        46,
+        96,
+        1280,
+        70,
+        scale=0.56,
+        color=MUTED,
+    )
+
+    missing = "Run snapshot capture while this map topic is publishing."
+    tile_image(
+        output,
+        find_optional_image(results_dir, "map_robot1_slam.png"),
+        44,
+        185,
+        780,
+        380,
+        "Robot 1 local map",
+        "/SLAM_map_1 | Occupancy belief grid created from robot 1 LiDAR.",
+        GREEN,
+        placeholder_note("/SLAM_map_1"),
+        crop_source=True,
+    )
+    tile_image(
+        output,
+        find_optional_image(results_dir, "map_robot2_slam.png"),
+        876,
+        185,
+        780,
+        380,
+        "Robot 2 local map",
+        "/SLAM_map_2 | Independent occupancy belief grid from robot 2.",
+        GREEN,
+        placeholder_note("/SLAM_map_2"),
+        crop_source=True,
+    )
+    tile_image(
+        output,
+        find_optional_image(results_dir, "map_merged.png"),
+        44,
+        620,
+        780,
+        380,
+        "Merged map",
+        "/merged_map | Map merger output when alignment confidence is high enough.",
+        RED,
+        missing,
+        crop_source=True,
+    )
+    tile_image(
+        output,
+        map_image,
+        876,
+        620,
+        780,
+        380,
+        "Final A* answer",
+        (
+            f"{summary.get('map_source', '?')} | shortest path from "
+            f"{parse_robot_id(summary)} start to the detected goal."
+        ),
+        BLUE,
+        "Final path map was not saved.",
+        crop_source=True,
+    )
+
+    path = results_dir / "report_visuals" / "report_map_progression.png"
+    cv2.imwrite(str(path), output)
+    return path
+
+
+def build_results_contact_sheet(results_dir: Path, visual_paths: Sequence[Path]) -> Path:
+    output = make_canvas(1800, 1320)
+    write_text(output, "Report Visual Results Pack", 44, 58, scale=1.08, thickness=2)
+    draw_text_box(
+        output,
+        "A compact index of the figures generated for the written report and demo explanation.",
+        46,
+        96,
+        1200,
+        60,
+        scale=0.56,
+        color=MUTED,
+    )
+
+    selected_names = [
+        "report_demo_evidence_panel.png",
+        "report_map_progression.png",
+        "report_cv_detection_evidence.png",
+        "report_waypoint_trace.png",
+        "report_system_flow.png",
+        "report_behavior_timeline.png",
+    ]
+    selected = [path for name in selected_names for path in visual_paths if path.name == name]
+    x_positions = [44, 624, 1204]
+    y_positions = [180, 730]
+    for index, path in enumerate(selected[:6]):
+        source = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        title = path.stem.replace("report_", "").replace("_", " ").title()
+        tile_image(
+            output,
+            source,
+            x_positions[index % 3],
+            y_positions[index // 3],
+            530,
+            500,
+            title,
+            path.name,
+            BLUE if index % 2 == 0 else DARK,
+            "Visual not generated.",
+        )
+
+    path = results_dir / "report_visuals" / "report_visual_results_pack.png"
+    cv2.imwrite(str(path), output)
+    return path
+
+
 def arrow(image: np.ndarray, start: Tuple[int, int], end: Tuple[int, int]) -> None:
     cv2.arrowedLine(image, start, end, DARK, 3, cv2.LINE_AA, tipLength=0.04)
 
@@ -317,7 +730,7 @@ def flow_box(
     card(image, x, y, w, h)
     cv2.rectangle(image, (x, y), (x + w, y + 10), accent, -1)
     write_text(image, title, x + 22, y + 42, scale=0.66, color=INK, thickness=2)
-    wrapped_text(image, body, x + 22, y + 82, width_chars=max(24, w // 10), scale=0.48, color=MUTED)
+    draw_text_box(image, body, x + 22, y + 82, w - 44, h - 100, scale=0.48, color=MUTED)
 
 
 def build_system_flow(results_dir: Path) -> Path:
@@ -458,7 +871,10 @@ def write_index(results_dir: Path, outputs: Sequence[Path], summary: Dict[str, s
             "",
             "Suggested report usage:",
             "",
+            "- `report_visual_results_pack.png`: contact sheet of the complete visual set.",
             "- `report_demo_evidence_panel.png`: main result figure.",
+            "- `report_map_progression.png`: individual robot maps, merged map, and final A* result.",
+            "- `report_cv_detection_evidence.png`: camera and segmentation evidence from live ROS topics.",
             "- `report_waypoint_trace.png`: clean A* waypoint/path figure.",
             "- `report_system_flow.png`: architecture diagram.",
             "- `report_topic_flow.png`: ROS evidence/topic diagram.",
@@ -493,11 +909,14 @@ def build_visuals(results_dir: Path) -> List[Path]:
 
     outputs = [
         build_evidence_panel(results_dir, summary, waypoints, map_image),
+        build_map_progression(results_dir, summary, map_image),
+        build_cv_detection_evidence(results_dir),
         build_waypoint_trace(results_dir, summary, waypoints),
         build_system_flow(results_dir),
         build_topic_flow(results_dir),
         build_behavior_timeline(results_dir),
     ]
+    outputs.append(build_results_contact_sheet(results_dir, outputs))
     outputs.append(write_index(results_dir, outputs, summary))
     return outputs
 

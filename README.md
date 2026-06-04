@@ -128,7 +128,15 @@ Final report artifacts:
 /root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
 ```
 
-Generate polished report visuals from those artifacts:
+While the demo is running, optionally capture live CV and map snapshots for the report pack:
+
+```bash
+python3 /root/ros2_ws/src/final_project_cv/tools/capture_report_snapshots.py \
+  --results-dir /root/ros2_ws/src/final_path_results \
+  --seconds 12
+```
+
+Then generate polished report visuals from the final path artifacts and any captured snapshots:
 
 ```bash
 python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
@@ -138,7 +146,10 @@ python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
 This creates:
 
 ```text
+/root/ros2_ws/src/final_path_results/report_visuals/report_visual_results_pack.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_map_progression.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_cv_detection_evidence.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png

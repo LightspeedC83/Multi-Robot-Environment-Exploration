@@ -154,7 +154,15 @@ Mission complete received; stopping exploration
 
 ## Report Visuals
 
-After a successful demo run, generate report-ready diagrams from the saved final path artifacts:
+While the demo is running, capture live CV and map snapshots:
+
+```bash
+python3 /root/ros2_ws/src/final_project_cv/tools/capture_report_snapshots.py \
+  --results-dir /root/ros2_ws/src/final_path_results \
+  --seconds 12
+```
+
+After the final path is saved, generate report-ready diagrams from the saved artifacts and snapshots:
 
 ```bash
 python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
@@ -164,7 +172,10 @@ python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
 Generated files:
 
 ```text
+/root/ros2_ws/src/final_path_results/report_visuals/report_visual_results_pack.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_map_progression.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_cv_detection_evidence.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png
