@@ -1240,6 +1240,55 @@ class Coordinator(Node):
 
         return None
 
+    def get_final_answer_path_between_cells(self, map, start_cell, goal_cell, map_width, map_height, map_res_m_per_cell):
+        """Plan the report answer to the detected goal cell with known obstacles respected."""
+        start_cell = self.clamp_cell(start_cell, map_width, map_height)
+        goal_cell = self.clamp_cell(goal_cell, map_width, map_height)
+        search_map = self.build_goal_optimistic_search_map(map, map_res_m_per_cell)
+
+        start_point = self.get_nearest_free_cell(start_cell[0], start_cell[1], search_map, map_width, map_height)
+        goal_point = goal_cell
+        #  goal clearing: the sphere itself can look occupied, but it is the endpoint.
+        search_map[goal_point[1]][goal_point[0]] = 0
+
+        path = self.a_star_path(search_map, start_point, goal_point, map_width, map_height, warn_on_failure=False)
+        if path is not None:
+            return path
+
+        return self.get_path_between_cells(map, start_cell, goal_cell, map_width, map_height, map_res_m_per_cell, use_bootstrap=True)
+
+    def expand_final_map_to_cells(self, map, start_cell, goal_cell, x_origin, y_origin, theta_origin, map_res_m_per_cell):
+        """Pad the final-answer map so the detected goal is not clipped off the diagram."""
+        height, width = map.shape
+        margin_cells = 6
+        min_x = min(0, start_cell[0], goal_cell[0]) - margin_cells
+        min_y = min(0, start_cell[1], goal_cell[1]) - margin_cells
+        max_x = max(width - 1, start_cell[0], goal_cell[0]) + margin_cells
+        max_y = max(height - 1, start_cell[1], goal_cell[1]) + margin_cells
+
+        pad_left = max(0, -min_x)
+        pad_bottom = max(0, -min_y)
+        pad_right = max(0, max_x - (width - 1))
+        pad_top = max(0, max_y - (height - 1))
+
+        if pad_left == 0 and pad_right == 0 and pad_bottom == 0 and pad_top == 0:
+            return map, x_origin, y_origin, width, height, start_cell, goal_cell
+
+        new_width = width + pad_left + pad_right
+        new_height = height + pad_bottom + pad_top
+        expanded_map = np.full((new_height, new_width), -1, dtype=map.dtype)
+        expanded_map[pad_bottom:pad_bottom + height, pad_left:pad_left + width] = map
+
+        #  origin moving: padding left/bottom means the grid starts earlier in map-frame meters.
+        origin_dx = pad_left * map_res_m_per_cell
+        origin_dy = pad_bottom * map_res_m_per_cell
+        new_x_origin = x_origin - (math.cos(theta_origin) * origin_dx - math.sin(theta_origin) * origin_dy)
+        new_y_origin = y_origin - (math.sin(theta_origin) * origin_dx + math.cos(theta_origin) * origin_dy)
+
+        shifted_start = (start_cell[0] + pad_left, start_cell[1] + pad_bottom)
+        shifted_goal = (goal_cell[0] + pad_left, goal_cell[1] + pad_bottom)
+        return expanded_map, new_x_origin, new_y_origin, new_width, new_height, shifted_start, shifted_goal
+
     def build_final_path_candidate(self, robot_id, map_msg, start_msg, goal_msg, path_kind, map_source):
         """Build one A* start-to-goal candidate in the frame of the supplied map."""
         map_frame = self.normalize_frame_id(map_msg.header.frame_id or f"robot{robot_id}/odom")
@@ -1252,8 +1301,18 @@ class Coordinator(Node):
         goal_cell = self.odom_to_cell(goal_odom[0], goal_odom[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
         start_cell = self.odom_to_cell(start_odom[0], start_odom[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
 
+        map, x_grid_origin, y_grid_origin, map_width, map_height, start_cell, goal_cell = self.expand_final_map_to_cells(
+            map,
+            start_cell,
+            goal_cell,
+            x_grid_origin,
+            y_grid_origin,
+            theta_grid_origin,
+            grid_res,
+        )
+
         #  final choosing: A* is run in the same frame as the map, never across mixed odoms.
-        path_cell = self.get_path_between_cells(map, start_cell, goal_cell, map_width, map_height, grid_res, use_bootstrap=True)
+        path_cell = self.get_final_answer_path_between_cells(map, start_cell, goal_cell, map_width, map_height, grid_res)
         if path_cell is None:
             return None
 
@@ -1784,7 +1843,12 @@ class Coordinator(Node):
                 #  goal freeze: after the real target is known, stop motion while A* evidence settles.
                 self.publish_stop_commands()
 
-        if self.final_path_msg is not None or self.num_active_robots <= 0:
+        if self.final_path_msg is not None:
+            #  Final holding: once the answer exists, every robot should stay parked for the demo.
+            self.publish_stop_commands()
+            return
+
+        if self.num_active_robots <= 0:
             return
 
         for robot_id in range(1, self.global_id + 1):

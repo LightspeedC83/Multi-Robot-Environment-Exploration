@@ -84,6 +84,7 @@ ESCAPE_FORWARD_VELOCITY = 0.16 # [m/s]
 ESCAPE_TURN_VELOCITY = 0.35 # [rad/s]
 STUCK_PROGRESS_EPS = 0.03 # [m]
 STUCK_WATCHDOG_SEC = 2.2 # [s]
+MISSION_STOP_BURST_SEC = 3.0 # [s] repeated zero commands after final answer latching
 
 USE_SIM_TIME = True
 STARTUP_TIMEOUT = 15.0 # s. Max wait for simulator/controller startup.
@@ -284,6 +285,7 @@ class WorldMapper(Node):
         # parameters for controlling local motion of robot
         self.done = False # if the robot has mapped its whole environment
         self.mission_complete_logged = False
+        self.mission_stop_until_wall_time = 0.0
         self.busy = False # if busy is true, then the robot is in the midst of an action
         self.action_done_time = self.get_clock().now() # this is the time at which the current action being excecuted will be finished
         self.next_motion_log_wall_time = 0.0
@@ -291,6 +293,7 @@ class WorldMapper(Node):
         # setting up transfer frames
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._mission_stop_timer = self.create_timer(0.1, self._mission_stop_timer_callback, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def _topic_from_template(self, template):
         """Fill the mapper/coordinator topic templates for this assigned robot."""
@@ -318,10 +321,23 @@ class WorldMapper(Node):
         self.nav_path = None
         self._fsm = fsm.OFF
         self._local_fsm = local_fsm.IDLE
+        self.mission_stop_until_wall_time = time.monotonic() + MISSION_STOP_BURST_SEC
         self.stop()
         if not self.mission_complete_logged:
             self.get_logger().info("Mission complete received; stopping exploration")
             self.mission_complete_logged = True
+
+    def _mission_stop_timer_callback(self):
+        """Keep final-stop commands alive long enough for Gazebo controllers to settle."""
+        if self.mission_stop_until_wall_time <= 0.0:
+            return
+
+        if time.monotonic() > self.mission_stop_until_wall_time:
+            self.mission_stop_until_wall_time = 0.0
+            return
+
+        #  Stop holding: late control ticks or buffered commands should lose to final answer.
+        self.stop()
 
 
     def request_id(self, requester_name):
@@ -423,6 +439,10 @@ class WorldMapper(Node):
 
     def move(self, linear_vel, angular_vel):
         """Send a velocity command (linear vel in m/s, angular vel in rad/s)."""
+        if self.done and self.stop_on_mission_complete:
+            self.stop()
+            return
+
         # Setting velocities.
         twist_msg = Twist()
 
