@@ -17,15 +17,15 @@ Mapping, local control, and planning/coordinator package for the multi-robot dem
 - assigns robot IDs through `/get_unique_id`,
 - subscribes to each robot map, pose, heuristic point, and goal point,
 - chooses frontier paths while the goal is unknown,
-- switches both robots to goal-directed paths once the goal is seen,
 - publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`,
-- saves final path SVG/CSV artifacts under `/root/ros2_ws/src/final_path_results/`,
+- publishes `/final_result_markers` for the chosen start, detected goal, and final path,
+- saves final path PNG/SVG/CSV artifacts under `/root/ros2_ws/src/final_path_results/`,
 - publishes `/mission_complete` and zero velocity commands when the answer is ready.
 
 ## Behavior
 
 - Unknown goal: robots explore frontier cells ranked by distance plus simulated raycast information gain, with heuristic bottle detections as soft search bias.
-- Goal seen: heuristic bias is disabled, and both robots receive goal-directed plans.
+- Goal seen: heuristic bias is disabled, robot motion is held at zero, and the coordinator publishes the final A* answer.
 - Obstacle handling: mappers maintain LiDAR clearance while moving, then back up, turn, and replan if motion still stalls near obstacles.
 - Path following: each mapper clips new paths to the nearest remaining waypoint before driving.
 - Final answer: the coordinator chooses the shortest available A* path from a robot starting pose to the detected goal.
@@ -59,6 +59,7 @@ Coordinator output:
 /nav_path_<id>
 /final_start_to_goal_path
 /final_start_to_goal_nav_path
+/final_result_markers
 /mission_complete
 ```
 
@@ -111,6 +112,7 @@ ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
 ros2 topic echo --qos-durability transient_local --once /merge_status
 ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
 ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
+ros2 topic echo --qos-durability transient_local --once /final_result_markers
 ros2 topic echo --once /mission_complete
 ```
 
@@ -118,5 +120,7 @@ Final path files:
 
 ```text
 /root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg
+/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
 /root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
+/root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
 ```

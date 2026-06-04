@@ -9,6 +9,7 @@ Panels:
         - /Merged Map1
         - /Final Start To Goal Path1
         - /Final Start To Goal Line1
+        - /Final Result Markers1
         - /Robot 1 Goal Segmentation1
         - /Robot 2 Goal Segmentation1
       Splitter Ratio: 0.5
@@ -110,6 +111,21 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /final_start_to_goal_nav_path
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Final Result Markers
+      Namespaces:
+        final_goal: true
+        final_labels: true
+        final_path: true
+        final_start: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /final_result_markers
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true

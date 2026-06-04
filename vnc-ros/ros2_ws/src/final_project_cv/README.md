@@ -7,7 +7,7 @@ Computer-vision and simulation package for the integrated two-robot demo. It pro
 - `sports ball`: goal target.
 - `bottle`: heuristic clue used only before the goal is found.
 
-Once a goal observation exists, the coordinator ignores heuristic detections and sends both robots toward the goal.
+Once a goal observation exists, the coordinator ignores heuristic detections, holds robot motion, and publishes the final A* answer.
 
 ## Detection And Localization
 
@@ -103,6 +103,7 @@ The RViz config includes the final shortest A* start-to-goal path as both a Pose
 ```text
 /final_start_to_goal_path
 /final_start_to_goal_nav_path
+/final_result_markers
 ```
 
 Map/planner evidence topics:

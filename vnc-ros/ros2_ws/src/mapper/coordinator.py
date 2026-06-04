@@ -29,6 +29,7 @@ from  nav_msgs.msg import MapMetaData # for the slam_map msg.info
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray, Point, Quaternion, PointStamped, Twist # for the ifnromation stored in slam_map msg.info
 from std_msgs.msg import Bool, Int32 # for id_active publisher
 from tf2_ros import Buffer, TransformListener
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 # importing custom services
@@ -126,6 +127,7 @@ class Coordinator(Node):
         self.last_plan_kind = {} # robot_id --> label for the kind of plan last published
         self.final_path_msg = None
         self.final_nav_path_msg = None
+        self.final_marker_msg = None
         self.final_path_robot_id = None
         self.final_path_length_m = None
         self.final_path_output_dir = Path(FINAL_PATH_OUTPUT_DIR)
@@ -159,6 +161,7 @@ class Coordinator(Node):
         self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id", registration_qos)
         self.final_path_publisher = self.create_publisher(PoseArray, "/final_start_to_goal_path", latched_qos)
         self.final_nav_path_publisher = self.create_publisher(NavPath, "/final_start_to_goal_nav_path", latched_qos)
+        self.final_marker_publisher = self.create_publisher(MarkerArray, "/final_result_markers", latched_qos)
         self.legacy_final_path_publisher = self.create_publisher(PoseArray, "/final_goal_to_start_path", latched_qos)
         self.legacy_final_nav_path_publisher = self.create_publisher(NavPath, "/final_goal_to_start_nav_path", latched_qos)
         self.mission_complete_publisher = self.create_publisher(Bool, "/mission_complete", 1)
@@ -207,6 +210,17 @@ class Coordinator(Node):
             response.success = False
             response.message = "Requester has no id"
             self.get_logger().warn(f"received path request from robot with no ID {requester_id}")
+            return response
+
+        if self.goal_target_msgs:
+            self.update_and_publish_final_goal_path(force=True)
+            self.publish_stop_commands()
+            if self.final_path_msg is not None:
+                response.success = True
+                response.message = "final path acquired; mission complete"
+                return response
+            response.success = False
+            response.message = "goal found; holding motion while final A* path is computed"
             return response
 
         # generating path
@@ -335,7 +349,8 @@ class Coordinator(Node):
                     f"({msg.point.x:.2f}, {msg.point.y:.2f})"
                 )
                 self.goal_seen_logged.add(robot_id)
-            self.plan_goal_for_all_ready_robots()
+            #  goal locking: once the real sphere exists, stop search motion and compute the answer.
+            self.publish_stop_commands()
         else:
             self.heuristic_target_msgs[robot_id] = msg
         self.update_and_publish_final_goal_path()
@@ -590,6 +605,86 @@ class Coordinator(Node):
             nav_path_msg.poses.append(pose_stamped)
         return nav_path_msg
 
+    def make_final_marker_array(self, best):
+        """Build RViz markers for the selected start, goal, and final path."""
+        marker_array = MarkerArray()
+        frame_id = best["frame_id"]
+        stamp = self.get_clock().now().to_msg()
+
+        def base_marker(marker_id, marker_type, namespace):
+            marker = Marker()
+            marker.header.frame_id = frame_id
+            marker.header.stamp = stamp
+            marker.ns = namespace
+            marker.id = marker_id
+            marker.type = marker_type
+            marker.action = Marker.ADD
+            marker.pose.orientation.w = 1.0
+            marker.lifetime.sec = 0
+            return marker
+
+        path_marker = base_marker(1, Marker.LINE_STRIP, "final_path")
+        path_marker.scale.x = 0.08
+        path_marker.color.r = 0.14
+        path_marker.color.g = 0.39
+        path_marker.color.b = 0.92
+        path_marker.color.a = 1.0
+        for x, y in best["path_odom"]:
+            path_marker.points.append(Point(x=float(x), y=float(y), z=0.08))
+        marker_array.markers.append(path_marker)
+
+        start_marker = base_marker(2, Marker.SPHERE, "final_start")
+        start_marker.pose.position.x = float(best["start_odom"][0])
+        start_marker.pose.position.y = float(best["start_odom"][1])
+        start_marker.pose.position.z = 0.18
+        start_marker.scale.x = 0.32
+        start_marker.scale.y = 0.32
+        start_marker.scale.z = 0.32
+        start_marker.color.r = 0.13
+        start_marker.color.g = 0.77
+        start_marker.color.b = 0.37
+        start_marker.color.a = 1.0
+        marker_array.markers.append(start_marker)
+
+        goal_marker = base_marker(3, Marker.SPHERE, "final_goal")
+        goal_marker.pose.position.x = float(best["goal_odom"][0])
+        goal_marker.pose.position.y = float(best["goal_odom"][1])
+        goal_marker.pose.position.z = 0.22
+        goal_marker.scale.x = 0.38
+        goal_marker.scale.y = 0.38
+        goal_marker.scale.z = 0.38
+        goal_marker.color.r = 0.98
+        goal_marker.color.g = 0.45
+        goal_marker.color.b = 0.07
+        goal_marker.color.a = 1.0
+        marker_array.markers.append(goal_marker)
+
+        start_label = base_marker(4, Marker.TEXT_VIEW_FACING, "final_labels")
+        start_label.pose.position.x = float(best["start_odom"][0])
+        start_label.pose.position.y = float(best["start_odom"][1])
+        start_label.pose.position.z = 0.55
+        start_label.scale.z = 0.22
+        start_label.color.r = 0.05
+        start_label.color.g = 0.35
+        start_label.color.b = 0.16
+        start_label.color.a = 1.0
+        start_label.text = f"chosen start: robot_{best['robot_id']}"
+        marker_array.markers.append(start_label)
+
+        goal_label = base_marker(5, Marker.TEXT_VIEW_FACING, "final_labels")
+        goal_label.pose.position.x = float(best["goal_odom"][0])
+        goal_label.pose.position.y = float(best["goal_odom"][1])
+        goal_label.pose.position.z = 0.62
+        goal_label.scale.z = 0.24
+        goal_label.color.r = 0.55
+        goal_label.color.g = 0.18
+        goal_label.color.b = 0.03
+        goal_label.color.a = 1.0
+        goal_label.text = "detected goal"
+        marker_array.markers.append(goal_label)
+
+        return marker_array
+
     def path_length(self, path_odom):
         """Return total polyline length in meters for an odom-space path."""
         if path_odom is None or len(path_odom) < 2:
@@ -606,6 +701,7 @@ class Coordinator(Node):
             self.final_path_output_dir.mkdir(parents=True, exist_ok=True)
             csv_path = self.final_path_output_dir / "final_start_to_goal_path.csv"
             svg_path = self.final_path_output_dir / "final_start_to_goal_path.svg"
+            png_path = self.final_path_output_dir / "final_start_to_goal_map.png"
             summary_path = self.final_path_output_dir / "final_start_to_goal_summary.txt"
 
             with csv_path.open("w", newline="") as csv_file:
@@ -615,6 +711,7 @@ class Coordinator(Node):
                     writer.writerow([idx, f"{pt[0]:.4f}", f"{pt[1]:.4f}", best["frame_id"]])
 
             svg_path.write_text(self.make_final_path_svg(best), encoding="utf-8")
+            png_saved = self.write_final_path_map_png(best, png_path)
             summary_path.write_text(
                 "\n".join([
                     f"robot_id: {best['robot_id']}",
@@ -625,13 +722,81 @@ class Coordinator(Node):
                     f"waypoints: {len(best['path_odom'])}",
                     f"start_xy: ({best['start_odom'][0]:.4f}, {best['start_odom'][1]:.4f})",
                     f"goal_xy: ({best['goal_odom'][0]:.4f}, {best['goal_odom'][1]:.4f})",
+                    f"map_png: {png_path if png_saved else 'not saved'}",
+                    f"path_svg: {svg_path}",
+                    f"path_csv: {csv_path}",
                 ]) + "\n",
                 encoding="utf-8",
             )
 
-            self.get_logger().info(f"final path artifacts saved: svg={svg_path}, csv={csv_path}")
+            self.get_logger().info(
+                f"final path artifacts saved: svg={svg_path}, csv={csv_path}, "
+                f"map_png={png_path if png_saved else 'not saved'}"
+            )
         except Exception as exc:
             self.get_logger().warn(f"could not save final path artifacts: {exc}")
+
+    def write_final_path_map_png(self, best, png_path):
+        """Save a report-friendly occupancy-map image with path/start/goal overlay."""
+        try:
+            import cv2
+        except Exception as exc:
+            self.get_logger().warn(f"could not save final path PNG because cv2 is unavailable: {exc}")
+            return False
+
+        grid = np.array(best.get("map_grid"), dtype=np.int16)
+        if grid.size == 0:
+            return False
+
+        h, w = grid.shape
+        display_grid = np.flipud(grid)
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+
+        unknown = display_grid < 0
+        occupied = display_grid >= MAP_OCCUPIED_THRESHOLD
+        known = ~unknown
+        freeish = known & ~occupied
+
+        img[unknown] = (170, 170, 170)
+        img[occupied] = (25, 35, 35)
+        if np.any(freeish):
+            vals = np.clip(display_grid[freeish], 0, MAP_OCCUPIED_THRESHOLD).astype(np.float32)
+            shade = (250 - vals * 1.4).clip(120, 250).astype(np.uint8)
+            img[freeish, 0] = shade
+            img[freeish, 1] = shade
+            img[freeish, 2] = shade
+
+        scale = max(3, min(8, int(1200 / max(h, w))))
+        img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+
+        def pixel(cell):
+            x, y = cell
+            return int((x + 0.5) * scale), int((h - 1 - y + 0.5) * scale)
+
+        path_cells = best.get("path_cells", [])
+        if len(path_cells) >= 2:
+            pts = np.array([pixel(cell) for cell in path_cells], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(img, [pts], False, (235, 99, 37), thickness=max(2, scale // 2), lineType=cv2.LINE_AA)
+
+        start_px = pixel(best["start_cell"])
+        goal_px = pixel(best["goal_cell"])
+        cv2.circle(img, start_px, max(5, scale * 2), (80, 190, 70), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(img, goal_px, max(6, scale * 2), (20, 120, 255), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.putText(img, f"start robot_{best['robot_id']}", (start_px[0] + 8, start_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 90, 20), 2, cv2.LINE_AA)
+        cv2.putText(img, "goal", (goal_px[0] + 8, goal_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 180), 2, cv2.LINE_AA)
+        cv2.putText(
+            img,
+            f"{best['path_kind']} on {best['map_source']} | {best['length_m']:.2f} m",
+            (20, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (30, 30, 30),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.imwrite(str(png_path), img)
+        return True
 
     def make_final_path_svg(self, best):
         """Build a small standalone SVG plot of the chosen final path."""
@@ -1103,6 +1268,10 @@ class Coordinator(Node):
             "frame_id": map_frame,
             "goal_odom": goal_odom,
             "start_odom": start_odom,
+            "goal_cell": goal_cell,
+            "start_cell": start_cell,
+            "path_cells": path_cell,
+            "map_grid": map.copy(),
         }
 
     def merged_final_path_candidates(self):
@@ -1191,6 +1360,7 @@ class Coordinator(Node):
         self.final_path_length_m = best["length_m"]
         self.final_path_msg = self.make_pose_array(best["robot_id"], best["path_odom"], frame_id=best["frame_id"])
         self.final_nav_path_msg = self.make_nav_path(best["robot_id"], best["path_odom"], frame_id=best["frame_id"])
+        self.final_marker_msg = self.make_final_marker_array(best)
         self.write_final_path_outputs(best)
         self.get_logger().info(
             f"GOAL FOUND: final A* path starts at robot_{best['robot_id']}, "
@@ -1208,76 +1378,16 @@ class Coordinator(Node):
             f"start_odom=({best['start_odom'][0]:.2f}, {best['start_odom'][1]:.2f}), "
             f"goal_odom=({best['goal_odom'][0]:.2f}, {best['goal_odom'][1]:.2f}), "
             "path_topic=/final_start_to_goal_path, nav_path_topic=/final_start_to_goal_nav_path, "
+            "markers_topic=/final_result_markers, "
             f"diagram={self.final_path_output_dir / 'final_start_to_goal_path.svg'}, "
+            f"map_png={self.final_path_output_dir / 'final_start_to_goal_map.png'}, "
             "stop_topic=/mission_complete"
         )
         return True
 
     def goal_approach_ready(self):
-        """Delay the final stop until the goal response has actually been visible."""
-        if not self.goal_first_seen_wall_times:
-            return True
-
-        wall_now = time.monotonic()
-        if not self.goal_approach_started_wall_times:
-            if wall_now >= self.next_goal_approach_status_wall_time:
-                #  approach arming: the camera saw the sphere, but the robot still needs map+pose first.
-                self.get_logger().info("final path waiting for a published goal-approach command")
-                self.next_goal_approach_status_wall_time = wall_now + 2.0
-            return False
-
-        first_approach_wall = min(self.goal_approach_started_wall_times.values())
-        elapsed = wall_now - first_approach_wall
-
-        arrived_distances = {}
-        watched_robots = []
-        for robot_id, pose_msg in self.pose_msgs.items():
-            goal_msg = self.get_goal_target_for_robot(robot_id)
-            if goal_msg is None:
-                continue
-            watched_robots.append(robot_id)
-            distance_to_goal = self.euclidean_distance(
-                (pose_msg.pose.position.x, pose_msg.pose.position.y),
-                (goal_msg.point.x, goal_msg.point.y),
-            )
-            if distance_to_goal <= FINAL_PATH_GOAL_CLOSE_RADIUS or robot_id in self.goal_path_completion_wall_times:
-                arrived_distances[robot_id] = distance_to_goal
-
-        if watched_robots and len(arrived_distances) == len(watched_robots) and elapsed >= FINAL_PATH_MIN_GOAL_APPROACH_SEC:
-            summary = ", ".join(
-                f"robot_{robot_id}={arrived_distances[robot_id]:.2f} m"
-                for robot_id in sorted(arrived_distances.keys())
-            )
-            #  final answer releasing: all robots with a pose have made the goal approach.
-            self.get_logger().info(f"goal approach complete for all ready robots; {summary}")
-            return True
-
-        if elapsed >= FINAL_PATH_MAX_GOAL_APPROACH_SEC:
-            if len(arrived_distances) > 0:
-                summary = ", ".join(
-                    f"robot_{robot_id}={distance:.2f} m"
-                    for robot_id, distance in sorted(arrived_distances.items())
-                )
-                self.get_logger().info(f"goal approach timeout with partial arrival; {summary}")
-                return True
-
-            if wall_now >= self.next_goal_approach_status_wall_time:
-                #  final answer releasing: goal chasing had its demo time, now the path answer matters.
-                self.get_logger().info(
-                    "goal approach timeout reached; releasing final path so the demo completes"
-                )
-                self.next_goal_approach_status_wall_time = wall_now + 2.0
-            return True
-
-        if wall_now >= self.next_goal_approach_status_wall_time:
-            #  goal approach waiting: keep driving before freezing the demo with mission_complete.
-            self.get_logger().info(
-                "final path waiting for visible goal approach "
-                f"(elapsed={elapsed:.1f}s, arrived={len(arrived_distances)}/{len(watched_robots)}, "
-                f"close_radius={FINAL_PATH_GOAL_CLOSE_RADIUS:.2f} m)"
-            )
-            self.next_goal_approach_status_wall_time = wall_now + 2.0
-        return False
+        """Allow final answer publication as soon as the goal and A* path exist."""
+        return True
 
     def publish_final_goal_path(self):
         """Republish the final demo answer once it has been selected."""
@@ -1294,6 +1404,10 @@ class Coordinator(Node):
                 pose_stamped.header.stamp = now.to_msg()
             self.final_nav_path_publisher.publish(self.final_nav_path_msg)
             self.legacy_final_nav_path_publisher.publish(self.final_nav_path_msg)
+        if self.final_marker_msg is not None:
+            for marker in self.final_marker_msg.markers:
+                marker.header.stamp = now.to_msg()
+            self.final_marker_publisher.publish(self.final_marker_msg)
 
         done_msg = Bool()
         done_msg.data = True
@@ -1667,7 +1781,8 @@ class Coordinator(Node):
         if self.goal_target_msgs:
             self.update_and_publish_final_goal_path()
             if self.final_path_msg is None:
-                self.plan_goal_for_all_ready_robots()
+                #  goal freeze: after the real target is known, stop motion while A* evidence settles.
+                self.publish_stop_commands()
 
         if self.final_path_msg is not None or self.num_active_robots <= 0:
             return

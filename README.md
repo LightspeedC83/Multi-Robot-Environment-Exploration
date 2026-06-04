@@ -6,8 +6,9 @@ Two robots explore an unknown Gazebo environment, build local occupancy-grid map
 
 - Each robot runs local mapping, obstacle avoidance, and frontier exploration.
 - Bottle detections are heuristic clues only before the goal is seen.
-- Once either robot sees the goal sphere, both robots switch to goal-directed motion and ignore heuristic clues.
+- Once either robot sees the goal sphere, heuristic clues are ignored and exploration motion freezes while the final A* answer is published.
 - The coordinator publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`.
+- The coordinator publishes final RViz markers on `/final_result_markers` for the chosen start, detected goal, and final path.
 - The coordinator saves final path evidence under `/root/ros2_ws/src/final_path_results/`.
 - When the final answer is available, `/mission_complete` stops robot motion.
 
@@ -78,7 +79,7 @@ source install/setup.bash
 rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
 ```
 
-The RViz config shows `/SLAM_map_1`, `/merged_map`, `/final_start_to_goal_path`, `/final_start_to_goal_nav_path`, and goal debug images for both robots. `/SLAM_map_2` is included but disabled by default; enable it after map alignment or switch the fixed frame to `robot2/odom` to inspect robot 2 locally.
+The RViz config shows `/SLAM_map_1`, `/merged_map`, `/final_start_to_goal_path`, `/final_start_to_goal_nav_path`, `/final_result_markers`, and goal debug images for both robots. `/SLAM_map_2` is included but disabled by default; enable it after map alignment or switch the fixed frame to `robot2/odom` to inspect robot 2 locally.
 
 Open larger camera/debug views:
 
@@ -105,16 +106,26 @@ ros2 topic echo --qos-durability transient_local --once /merged_map
 ros2 topic echo --qos-durability transient_local --once /merge_status
 ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
 ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
+ros2 topic echo --qos-durability transient_local --once /final_result_markers
 ros2 topic echo --once /mission_complete
 ```
 
 Successful demo logs include:
 
 ```text
-FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., path_length_m=..., waypoints=...
+FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., path_length_m=..., waypoints=..., markers_topic=/final_result_markers
 merged_map_published anchor=robot1 follower=robot2 confidence=...
-final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg, csv=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
+final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg, csv=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv, map_png=/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
 Mission complete received; stopping exploration
+```
+
+Final report artifacts:
+
+```text
+/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
+/root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
 ```
 
 ## Packages
