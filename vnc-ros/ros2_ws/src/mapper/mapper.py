@@ -67,6 +67,15 @@ MAP_OCCUPIED_THRESHOLD = 80 # program treats any value above this as occupied an
 PROTECTION_RADIUS = 0.3 # [m] The radius within which the robot will stop if it detects something, then it will wait and find a new path to nearest frontier
 FORWARD_PROTECTION_ANGLE_RAD = math.radians(45)
 EMERGENCY_PROTECTION_RADIUS = 0.12 # [m]
+CLEARANCE_TARGET_RADIUS = 0.46 # [m] normal LiDAR spacing we try to preserve while driving past objects
+CLEARANCE_SOFT_RADIUS = 0.68 # [m] begin steering away before the emergency layer has to fire
+CLEARANCE_HARD_STOP_RADIUS = 0.24 # [m] stop forward motion and turn when the front gap gets this tight
+CLEARANCE_SCAN_STALE_SEC = 0.45 # [s]
+CLEARANCE_FRONT_TURN = 0.28 # [rad/s]
+CLEARANCE_FRONT_GAIN = 0.75
+CLEARANCE_SIDE_GAIN = 0.65
+CLEARANCE_MAX_TURN = 0.62 # [rad/s]
+CLEARANCE_MIN_LINEAR = 0.06 # [m/s]
 LASER_SLEEP_TIME_AFTER_INTERRUPT = 2 # [s] short cooldown after local escape, not a minute-long trap
 ESCAPE_BACKUP_TIME = 0.8 # [s]
 ESCAPE_TURN_TIME = 1.1 # [s]
@@ -264,6 +273,9 @@ class WorldMapper(Node):
         self.escape_linear_velocity = ESCAPE_BACKUP_VELOCITY
         self.motion_watchdog_pose = None
         self.motion_watchdog_wall_time = time.monotonic()
+        self.latest_scan_msg = None
+        self.latest_scan_wall_time = 0.0
+        self.next_clearance_log_wall_time = 0.0
 
         # parameters for local level robot rotational and translational speed
         self.LINEAR_VELOCITY = LINEAR_VELOCITY
@@ -425,6 +437,79 @@ class WorldMapper(Node):
         """Stop the robot."""
         twist_msg = Twist()
         self._cmd_pub.publish(twist_msg)
+
+    def clamp(self, value, low, high):
+        """Keep a numeric value inside a bounded interval."""
+        return max(low, min(high, value))
+
+    def scan_sector_min(self, msg, min_angle, max_angle):
+        """Return the closest finite LiDAR range inside an angular sector."""
+        closest = None
+        for i, ray_length in enumerate(msg.ranges):
+            if math.isnan(ray_length) or math.isinf(ray_length):
+                continue
+            if ray_length < msg.range_min or ray_length > msg.range_max:
+                continue
+
+            angle = msg.angle_min + i * msg.angle_increment
+            if min_angle <= angle <= max_angle:
+                closest = ray_length if closest is None else min(closest, ray_length)
+
+        return msg.range_max if closest is None else closest
+
+    def clearance_drive_command(self, default_linear):
+        """Shape forward motion so LiDAR keeps a little breathing room around obstacles."""
+        if self.latest_scan_msg is None:
+            return default_linear, 0.0
+
+        wall_now = time.monotonic()
+        if wall_now - self.latest_scan_wall_time > CLEARANCE_SCAN_STALE_SEC:
+            return default_linear, 0.0
+
+        msg = self.latest_scan_msg
+        front = self.scan_sector_min(msg, math.radians(-22), math.radians(22))
+        front_left = self.scan_sector_min(msg, math.radians(22), math.radians(70))
+        front_right = self.scan_sector_min(msg, math.radians(-70), math.radians(-22))
+        left = self.scan_sector_min(msg, math.radians(70), math.radians(120))
+        right = self.scan_sector_min(msg, math.radians(-120), math.radians(-70))
+
+        linear = default_linear
+        angular = 0.0
+
+        if front < CLEARANCE_SOFT_RADIUS:
+            left_space = min(front_left, left)
+            right_space = min(front_right, right)
+            turn_direction = 1.0 if left_space >= right_space else -1.0
+            front_error = max(0.0, CLEARANCE_TARGET_RADIUS - front)
+            angular += turn_direction * (CLEARANCE_FRONT_TURN + CLEARANCE_FRONT_GAIN * front_error / CLEARANCE_TARGET_RADIUS)
+
+            if front <= CLEARANCE_HARD_STOP_RADIUS:
+                linear = 0.0
+            else:
+                usable = (front - CLEARANCE_HARD_STOP_RADIUS) / (CLEARANCE_SOFT_RADIUS - CLEARANCE_HARD_STOP_RADIUS)
+                linear = max(CLEARANCE_MIN_LINEAR, default_linear * self.clamp(usable, 0.15, 0.85))
+
+        left_penalty = max(0.0, CLEARANCE_TARGET_RADIUS - min(left, front_left))
+        right_penalty = max(0.0, CLEARANCE_TARGET_RADIUS - min(right, front_right))
+        if left_penalty > 0.0 or right_penalty > 0.0:
+            # clearance holding: right-side pressure turns left, left-side pressure turns right.
+            angular += CLEARANCE_SIDE_GAIN * (right_penalty - left_penalty) / CLEARANCE_TARGET_RADIUS
+            if front >= CLEARANCE_SOFT_RADIUS:
+                linear = min(linear, default_linear * 0.82)
+
+        angular = self.clamp(angular, -CLEARANCE_MAX_TURN, CLEARANCE_MAX_TURN)
+        if abs(angular) > 0.42:
+            linear = min(linear, default_linear * 0.65)
+
+        if (abs(angular) > 0.05 or linear < default_linear * 0.95) and wall_now >= self.next_clearance_log_wall_time:
+            self.get_logger().info(
+                "clearance control: "
+                f"front={front:.2f}m left={left:.2f}m right={right:.2f}m "
+                f"cmd=({linear:.2f}, {angular:.2f})"
+            )
+            self.next_clearance_log_wall_time = wall_now + 1.0
+
+        return linear, angular
 
     def begin_escape_recovery(self, reason, turn_direction=1.0, linear_velocity=ESCAPE_BACKUP_VELOCITY):
         """Start a small physical escape before asking for another planner path."""
@@ -635,6 +720,9 @@ class WorldMapper(Node):
 
     def _laser_callback(self, msg):
         """Processing of laser message."""
+        self.latest_scan_msg = msg
+        self.latest_scan_wall_time = time.monotonic()
+
         # Access to the index of the measurement in front of the robot.
         # LaserScan message https://docs.ros2.org/foxy/api/sensor_msgs/msg/LaserScan.html
         # NOTE: index 0 corresponds to min_angle, 
@@ -1301,7 +1389,8 @@ class WorldMapper(Node):
             if self._local_fsm == local_fsm.MOVING: # if we are in the movement state
                 if self.watch_motion_progress():
                     return
-                self.move(self.LINEAR_VELOCITY, 0.0) # send the move command
+                linear_cmd, angular_cmd = self.clearance_drive_command(self.LINEAR_VELOCITY)
+                self.move(linear_cmd, angular_cmd) # send the move command with LiDAR clearance shaping
                 if time.monotonic() > self.translation_done_wall_time: # if the movement action is done, we are done with this action and we set busy to false
                     self.busy = False
                     self.motion_watchdog_pose = None

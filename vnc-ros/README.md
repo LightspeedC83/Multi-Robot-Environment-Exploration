@@ -38,6 +38,30 @@ source install/setup.bash
 
 The host folder `vnc-ros/ros2_ws/src` is mounted into the container at `/root/ros2_ws/src`, so local edits are visible inside Docker.
 
+## Topic Convention
+
+Coordination topics use flat IDs:
+
+```text
+/new_robot_id
+/SLAM_map_<id>
+/pose_<id>
+/id_active_<id>
+/nav_path_<id>
+```
+
+Robot hardware, sensor, and CV topics use robot namespaces:
+
+```text
+/robot<id>/cmd_vel
+/robot<id>/scan
+/robot<id>/odom
+/robot<id>/goal_point_odom
+/robot<id>/heuristic_point_odom
+```
+
+Use `/SLAM_map_<id>` for mapper output. `/robot<id>/SLAM_map` is accepted only as a merger compatibility alias for older code.
+
 ## Run The Integrated Demo
 
 Terminal 1, simulation and autonomy:
@@ -77,7 +101,7 @@ RViz shows:
 
 - `/SLAM_map_1` for robot 1's live occupancy grid.
 - `/merged_map` when map alignment has enough confidence.
-- `/final_goal_to_start_path` after the final answer is available.
+- `/final_start_to_goal_path` and `/final_start_to_goal_nav_path` after the final answer is available.
 - Goal segmentation image panels for both robot cameras.
 - `/SLAM_map_2` disabled by default; enable it after map alignment or switch fixed frame to `robot2/odom`.
 
@@ -106,9 +130,11 @@ Useful image topics:
 ```bash
 ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
 ros2 topic echo --qos-durability transient_local --once /merged_map
+ros2 topic echo --qos-durability transient_local --once /merge_status
 ros2 topic echo /robot1/goal_point_odom
 ros2 topic echo /robot2/goal_point_odom
-ros2 topic echo --qos-durability transient_local --once /final_goal_to_start_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
 ros2 topic echo --once /mission_complete
 ```
 
@@ -117,17 +143,20 @@ Important terminal lines:
 ```text
 Goal point for robot ... using ...
 cmd_vel publishing: linear=...
-GOAL FOUND: final planner path uses robot_... start, path_length=... m
-FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., path_length_m=...
+merged_map_published anchor=robot1 follower=robot2 confidence=...
+GOAL FOUND: final A* path starts at robot_..., path_length=... m, map_source=...
+FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., map_source=..., path_frame=..., path_length_m=...
+final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg, csv=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
 Mission complete received; stopping exploration
 ```
 
 ## Behavior Summary
 
 - Robots explore frontiers while the goal is unknown.
+- Robot motion uses LiDAR clearance shaping while moving, so it slows and turns away before emergency recovery is needed.
 - Heuristic bottle detections bias frontier choice before goal detection.
 - As soon as a goal sphere is seen by either robot, both robots receive goal-directed plans and the heuristic is ignored.
-- The final returned path is from the detected goal to the closest robot start, chosen by path length.
+- The final returned path is the shortest A* route from a robot start to the detected goal, chosen by path length.
 
 ## Reset
 

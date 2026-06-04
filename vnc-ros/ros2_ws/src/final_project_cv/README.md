@@ -98,6 +98,22 @@ RViz:
 rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
 ```
 
+The RViz config includes the final shortest A* start-to-goal path as both a PoseArray and a continuous Path line:
+
+```text
+/final_start_to_goal_path
+/final_start_to_goal_nav_path
+```
+
+Map/planner evidence topics:
+
+```text
+/SLAM_map_1
+/SLAM_map_2
+/merged_map
+/merge_status
+```
+
 Camera overlays:
 
 ```bash

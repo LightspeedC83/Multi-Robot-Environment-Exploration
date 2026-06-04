@@ -4,10 +4,12 @@
 # Multi-robot planning and coordination node.
 
 # Import of python modules.
+import csv
 import math # use of pi.
 import random # use for generating a random real number
 from enum import Enum
 import time
+from pathlib import Path
 import numpy as np # for map grid representations and operations
 from anytree import Node as TreeNode # for search algorithms (so important to import as Tree node because we have a Node class from ros2 already
 import heapq # for A*
@@ -19,12 +21,14 @@ import rclpy # module for ROS APIs
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.clock import Clock, ClockType
+from rclpy.time import Time
 from rclpy.signals import SignalHandlerOptions
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from nav_msgs.msg import OccupancyGrid # message type for occupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path as NavPath # message type for occupancyGrid
 from  nav_msgs.msg import MapMetaData # for the slam_map msg.info
 from geometry_msgs.msg import Pose, PoseStamped, PoseArray, Point, Quaternion, PointStamped, Twist # for the ifnromation stored in slam_map msg.info
 from std_msgs.msg import Bool, Int32 # for id_active publisher
+from tf2_ros import Buffer, TransformListener
 
 
 # importing custom services
@@ -58,7 +62,7 @@ GOAL_COMPLETION_ACCEPT_RADIUS_M = 1.1 # [m] path-consumed is only an arrival hin
 FINAL_PATH_MIN_GOAL_APPROACH_SEC = 6.0 # let the robot visibly commit before the stop message
 FINAL_PATH_MAX_GOAL_APPROACH_SEC = 18.0 # don't let a stuck approach hide the returned answer forever
 FINAL_PATH_GOAL_CLOSE_RADIUS = 0.45 # [m] close enough for the video/demo handoff
-FINAL_PATH_ESTIMATE_TIMEOUT_SEC = 24.0 # after this, log an estimated fallback if A* never connects
+FINAL_PATH_OUTPUT_DIR = "/root/ros2_ws/src/final_path_results"
 PATH_SIMPLIFY_MAX_LOOKAHEAD = 24 # cells; keeps A* path intent while cutting tiny steering chops
 A_STAR_MAX_EXPANSIONS = 25000 # bounding: final-path search should not freeze the ROS node
 A_STAR_TIME_BUDGET_SEC = 0.35 # planning breathing: keep callbacks responsive during the demo
@@ -121,8 +125,10 @@ class Coordinator(Node):
         self.next_goal_anchor_log_wall_time = 0.0
         self.last_plan_kind = {} # robot_id --> label for the kind of plan last published
         self.final_path_msg = None
+        self.final_nav_path_msg = None
         self.final_path_robot_id = None
         self.final_path_length_m = None
+        self.final_path_output_dir = Path(FINAL_PATH_OUTPUT_DIR)
         self.next_final_path_attempt_wall_time = 0.0
         self.next_final_path_status_time = self.get_clock().now()
         self.next_goal_approach_status_wall_time = 0.0
@@ -144,13 +150,27 @@ class Coordinator(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id", 1)
-        self.final_path_publisher = self.create_publisher(PoseArray, "/final_goal_to_start_path", latched_qos)
+        registration_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=20,
+        )
+        self.new_robot_id_publisher = self.create_publisher(Int32, "/new_robot_id", registration_qos)
+        self.final_path_publisher = self.create_publisher(PoseArray, "/final_start_to_goal_path", latched_qos)
+        self.final_nav_path_publisher = self.create_publisher(NavPath, "/final_start_to_goal_nav_path", latched_qos)
+        self.legacy_final_path_publisher = self.create_publisher(PoseArray, "/final_goal_to_start_path", latched_qos)
+        self.legacy_final_nav_path_publisher = self.create_publisher(NavPath, "/final_goal_to_start_nav_path", latched_qos)
         self.mission_complete_publisher = self.create_publisher(Bool, "/mission_complete", 1)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         ## setting up subscriber to the merged_map topic 
         # right now the merged map always treats robot_1 
-        self.merged_map_sub = self.create_subscription(OccupancyGrid, "merged_map", self._merged_map_callback, 1)
+        self.merged_map_sub = self.create_subscription(OccupancyGrid, "/merged_map", self._merged_map_callback, latched_qos)
+        self.merged_map_msg = None
+        self.merged_map_frame_id = None
         self.merged_map_info = None
         self.merged_map = None
 
@@ -395,6 +415,8 @@ class Coordinator(Node):
 
     def _merged_map_callback(self, msg:OccupancyGrid):
         """Callback function for updating the local version of the merged map, updates self.merged_map_info (a MapMetaData) and self.merged_map (a 2D array) """
+        self.merged_map_msg = msg
+        self.merged_map_frame_id = msg.header.frame_id
         self.merged_map_timestamp = msg.header.stamp
 
         self.merged_map_info = msg.info
@@ -445,6 +467,56 @@ class Coordinator(Node):
         ) # converting to regular angle
 
         return theta
+
+    def normalize_frame_id(self, frame_id):
+        """Return a comparable TF frame name."""
+        return (frame_id or "").lstrip("/")
+
+    def transform_xy_to_frame(self, x, y, source_frame, target_frame):
+        """Transform a 2D point between odom frames using the merger's TF."""
+        source_frame = self.normalize_frame_id(source_frame)
+        target_frame = self.normalize_frame_id(target_frame)
+        if not source_frame or not target_frame:
+            return None
+        if source_frame == target_frame:
+            return x, y
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except Exception:
+            return None
+
+        theta = self.quaternion_to_theta(transform.transform.rotation)
+        c = math.cos(theta)
+        s = math.sin(theta)
+        tx = transform.transform.translation.x
+        ty = transform.transform.translation.y
+        return c * x - s * y + tx, s * x + c * y + ty
+
+    def pose_xy_in_frame(self, pose_msg, target_frame, fallback_frame):
+        """Read a PoseStamped position in the requested map frame."""
+        source_frame = pose_msg.header.frame_id or fallback_frame
+        return self.transform_xy_to_frame(
+            pose_msg.pose.position.x,
+            pose_msg.pose.position.y,
+            source_frame,
+            target_frame,
+        )
+
+    def point_xy_in_frame(self, point_msg, target_frame, fallback_frame):
+        """Read a PointStamped target in the requested map frame."""
+        source_frame = point_msg.header.frame_id or fallback_frame
+        return self.transform_xy_to_frame(
+            point_msg.point.x,
+            point_msg.point.y,
+            source_frame,
+            target_frame,
+        )
     
     
     def odom_to_cell(self, x_robot_odom, y_robot_odom, x_map_origin, y_map_origin, theta_map_origin, map_res):
@@ -476,11 +548,13 @@ class Coordinator(Node):
 
         return x_robot_odom, y_robot_odom
 
-    def make_pose_array(self, robot_id, path_odom):
+    def make_pose_array(self, robot_id, path_odom, frame_id=None):
         """Turn an odom-space path into a PoseArray for publishing."""
         pose_arr_msg = PoseArray()
         pose_arr_msg.header.stamp = self.get_clock().now().to_msg()
-        if robot_id in self.map_msgs:
+        if frame_id is not None:
+            pose_arr_msg.header.frame_id = frame_id
+        elif robot_id in self.map_msgs:
             pose_arr_msg.header.frame_id = self.map_msgs[robot_id].header.frame_id
         else:
             pose_arr_msg.header.frame_id = f"robot{robot_id}/odom"
@@ -495,6 +569,27 @@ class Coordinator(Node):
             pose_arr_msg.poses.append(pose)
         return pose_arr_msg
 
+    def make_nav_path(self, robot_id, path_odom, frame_id=None):
+        """Turn an odom-space path into nav_msgs/Path for RViz."""
+        nav_path_msg = NavPath()
+        nav_path_msg.header.stamp = self.get_clock().now().to_msg()
+        if frame_id is not None:
+            nav_path_msg.header.frame_id = frame_id
+        elif robot_id in self.map_msgs:
+            nav_path_msg.header.frame_id = self.map_msgs[robot_id].header.frame_id
+        else:
+            nav_path_msg.header.frame_id = f"robot{robot_id}/odom"
+
+        for pt in path_odom:
+            pose_stamped = PoseStamped()
+            pose_stamped.header = nav_path_msg.header
+            pose_stamped.pose.position.x = pt[0]
+            pose_stamped.pose.position.y = pt[1]
+            pose_stamped.pose.position.z = 0.0
+            pose_stamped.pose.orientation.w = 1.0
+            nav_path_msg.poses.append(pose_stamped)
+        return nav_path_msg
+
     def path_length(self, path_odom):
         """Return total polyline length in meters for an odom-space path."""
         if path_odom is None or len(path_odom) < 2:
@@ -504,6 +599,108 @@ class Coordinator(Node):
         for i in range(1, len(path_odom)):
             total += self.euclidean_distance(path_odom[i - 1], path_odom[i])
         return total
+
+    def write_final_path_outputs(self, best):
+        """Save the recovered final path as a CSV and simple SVG diagram."""
+        try:
+            self.final_path_output_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = self.final_path_output_dir / "final_start_to_goal_path.csv"
+            svg_path = self.final_path_output_dir / "final_start_to_goal_path.svg"
+            summary_path = self.final_path_output_dir / "final_start_to_goal_summary.txt"
+
+            with csv_path.open("w", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(["index", "x_m", "y_m", "frame_id"])
+                for idx, pt in enumerate(best["path_odom"]):
+                    writer.writerow([idx, f"{pt[0]:.4f}", f"{pt[1]:.4f}", best["frame_id"]])
+
+            svg_path.write_text(self.make_final_path_svg(best), encoding="utf-8")
+            summary_path.write_text(
+                "\n".join([
+                    f"robot_id: {best['robot_id']}",
+                    f"path_kind: {best['path_kind']}",
+                    f"map_source: {best['map_source']}",
+                    f"path_frame: {best['frame_id']}",
+                    f"path_length_m: {best['length_m']:.4f}",
+                    f"waypoints: {len(best['path_odom'])}",
+                    f"start_xy: ({best['start_odom'][0]:.4f}, {best['start_odom'][1]:.4f})",
+                    f"goal_xy: ({best['goal_odom'][0]:.4f}, {best['goal_odom'][1]:.4f})",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            self.get_logger().info(f"final path artifacts saved: svg={svg_path}, csv={csv_path}")
+        except Exception as exc:
+            self.get_logger().warn(f"could not save final path artifacts: {exc}")
+
+    def make_final_path_svg(self, best):
+        """Build a small standalone SVG plot of the chosen final path."""
+        path_odom = best["path_odom"]
+        all_points = list(path_odom) + [best["goal_odom"], best["start_odom"]]
+        min_x = min(pt[0] for pt in all_points) - 0.5
+        max_x = max(pt[0] for pt in all_points) + 0.5
+        min_y = min(pt[1] for pt in all_points) - 0.5
+        max_y = max(pt[1] for pt in all_points) + 0.5
+
+        width = 960
+        height = 720
+        pad = 70
+        plot_w = width - 2 * pad
+        plot_h = height - 2 * pad
+        scale = min(plot_w / max(1.0, max_x - min_x), plot_h / max(1.0, max_y - min_y))
+
+        def sx(x):
+            return pad + (x - min_x) * scale
+
+        def sy(y):
+            return height - pad - (y - min_y) * scale
+
+        elems = [
+            '<svg xmlns="http://www.w3.org/2000/svg" width="960" height="720" viewBox="0 0 960 720">',
+            '<rect width="960" height="720" fill="#fbfbf8"/>',
+            '<text x="34" y="42" font-family="Arial" font-size="24" fill="#1f2933">Final start-to-goal A* path</text>',
+            (
+                f'<text x="34" y="70" font-family="Arial" font-size="15" fill="#52616b">'
+                f"robot_{best['robot_id']} start, {best['path_kind']} path, "
+                f"{best['length_m']:.2f} m, {len(path_odom)} waypoints, "
+                f"frame {best['frame_id']}</text>"
+            ),
+        ]
+
+        min_grid_x = math.floor(min_x)
+        max_grid_x = math.ceil(max_x)
+        min_grid_y = math.floor(min_y)
+        max_grid_y = math.ceil(max_y)
+        if max_grid_x - min_grid_x <= 40 and max_grid_y - min_grid_y <= 40:
+            for gx in range(min_grid_x, max_grid_x + 1):
+                x = sx(gx)
+                elems.append(f'<line x1="{x:.1f}" y1="{pad}" x2="{x:.1f}" y2="{height - pad}" stroke="#e3e7e8" stroke-width="1"/>')
+            for gy in range(min_grid_y, max_grid_y + 1):
+                y = sy(gy)
+                elems.append(f'<line x1="{pad}" y1="{y:.1f}" x2="{width - pad}" y2="{y:.1f}" stroke="#e3e7e8" stroke-width="1"/>')
+
+        elems.append(f'<rect x="{pad}" y="{pad}" width="{plot_w}" height="{plot_h}" fill="none" stroke="#88939a" stroke-width="2"/>')
+
+        if len(path_odom) >= 2:
+            path_points = " ".join(f"{sx(pt[0]):.1f},{sy(pt[1]):.1f}" for pt in path_odom)
+            elems.append(f'<polyline points="{path_points}" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>')
+
+        waypoint_step = max(1, len(path_odom) // 80)
+        for idx, pt in enumerate(path_odom):
+            if idx % waypoint_step == 0:
+                elems.append(f'<circle cx="{sx(pt[0]):.1f}" cy="{sy(pt[1]):.1f}" r="3" fill="#1d4ed8"/>')
+
+        goal_x, goal_y = best["goal_odom"]
+        start_x, start_y = best["start_odom"]
+        elems.extend([
+            f'<circle cx="{sx(goal_x):.1f}" cy="{sy(goal_y):.1f}" r="10" fill="#f97316" stroke="#7c2d12" stroke-width="2"/>',
+            f'<text x="{sx(goal_x) + 14:.1f}" y="{sy(goal_y) - 10:.1f}" font-family="Arial" font-size="14" fill="#7c2d12">goal</text>',
+            f'<circle cx="{sx(start_x):.1f}" cy="{sy(start_y):.1f}" r="10" fill="#22c55e" stroke="#14532d" stroke-width="2"/>',
+            f'<text x="{sx(start_x) + 14:.1f}" y="{sy(start_y) + 5:.1f}" font-family="Arial" font-size="14" fill="#14532d">robot_{best["robot_id"]} start</text>',
+            f'<text x="34" y="690" font-family="Arial" font-size="13" fill="#52616b">Saved by coordinator: {self.final_path_output_dir}</text>',
+            "</svg>",
+        ])
+        return "\n".join(elems)
 
     def make_direct_odom_path(self, start_odom, goal_odom, steps=24):
         """Make a visible fallback path in odom coordinates."""
@@ -878,29 +1075,58 @@ class Coordinator(Node):
 
         return None
 
-    def update_final_goal_path(self):
-        """Choose the shortest available path from a found goal to a robot start."""
-        if self.final_path_msg is not None:
-            return True
+    def build_final_path_candidate(self, robot_id, map_msg, start_msg, goal_msg, path_kind, map_source):
+        """Build one A* start-to-goal candidate in the frame of the supplied map."""
+        map_frame = self.normalize_frame_id(map_msg.header.frame_id or f"robot{robot_id}/odom")
+        start_odom = self.pose_xy_in_frame(start_msg, map_frame, f"robot{robot_id}/odom")
+        goal_odom = self.point_xy_in_frame(goal_msg, map_frame, goal_msg.header.frame_id or f"robot{robot_id}/odom")
+        if start_odom is None or goal_odom is None:
+            return None
 
-        best = None
-        best_estimated = None
-        now = self.get_clock().now()
-        if self.global_id > 0:
-            if len(self.start_pose_msgs) < self.global_id or len(self.map_msgs) < self.global_id:
-                if now.nanoseconds >= self.next_final_path_status_time.nanoseconds:
-                    #  final path waiting: both robots need starts and maps before choosing the closest start.
-                    self.get_logger().info(
-                        "final path waiting for demo inputs "
-                        f"(robots={self.global_id}, starts={len(self.start_pose_msgs)}, "
-                        f"maps={len(self.map_msgs)})"
-                    )
-                    self.next_final_path_status_time = now + Duration(seconds=2.0)
-                return False
+        map, grid_res, x_grid_origin, y_grid_origin, theta_grid_origin, map_width, map_height, _ = self.unpack_map_msg(map_msg)
+        goal_cell = self.odom_to_cell(goal_odom[0], goal_odom[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
+        start_cell = self.odom_to_cell(start_odom[0], start_odom[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
 
-        if not self.goal_approach_ready():
-            return False
+        #  final choosing: A* is run in the same frame as the map, never across mixed odoms.
+        path_cell = self.get_path_between_cells(map, start_cell, goal_cell, map_width, map_height, grid_res, use_bootstrap=True)
+        if path_cell is None:
+            return None
 
+        path_odom = [self.cell_to_odom(pt[0], pt[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res) for pt in path_cell]
+        length_m = self.path_length(path_odom)
+        return {
+            "robot_id": robot_id,
+            "length_m": length_m,
+            "path_odom": path_odom,
+            "path_kind": path_kind,
+            "map_source": map_source,
+            "frame_id": map_frame,
+            "goal_odom": goal_odom,
+            "start_odom": start_odom,
+        }
+
+    def merged_final_path_candidates(self):
+        """Return comparable candidates on /merged_map when map-frame TF is available."""
+        if self.merged_map_msg is None or self.shared_goal_target_msg is None:
+            return []
+
+        candidates = []
+        for robot_id, start_msg in self.start_pose_msgs.items():
+            candidate = self.build_final_path_candidate(
+                robot_id,
+                self.merged_map_msg,
+                start_msg,
+                self.shared_goal_target_msg,
+                path_kind="merged_map_a_star",
+                map_source="/merged_map",
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def local_final_path_candidates(self):
+        """Return local-map candidates as a fallback before a usable merge exists."""
+        candidates = []
         for robot_id in set(list(self.map_msgs.keys()) + list(self.start_pose_msgs.keys())):
             goal_msg = self.get_goal_target_for_robot(robot_id)
             if goal_msg is None:
@@ -908,56 +1134,53 @@ class Coordinator(Node):
             if robot_id not in self.map_msgs or robot_id not in self.start_pose_msgs:
                 continue
 
-            map, grid_res, x_grid_origin, y_grid_origin, theta_grid_origin, map_width, map_height, _ = self.unpack_map_msg(self.map_msgs[robot_id])
-            start_msg = self.start_pose_msgs[robot_id]
+            candidate = self.build_final_path_candidate(
+                robot_id,
+                self.map_msgs[robot_id],
+                self.start_pose_msgs[robot_id],
+                goal_msg,
+                path_kind="local_map_a_star",
+                map_source=f"/SLAM_map_{robot_id}",
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
 
-            goal_cell = self.odom_to_cell(goal_msg.point.x, goal_msg.point.y, x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
-            start_cell = self.odom_to_cell(start_msg.pose.position.x, start_msg.pose.position.y, x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
-            goal_odom = (goal_msg.point.x, goal_msg.point.y)
-            start_odom = (start_msg.pose.position.x, start_msg.pose.position.y)
+    def update_final_goal_path(self):
+        """Choose the shortest A* path from a robot start to the found goal."""
+        if self.final_path_msg is not None:
+            return True
 
-            # Final path going: goal -> start, because that is what the demo statement asks to return.
-            path_cell = self.get_path_between_cells(map, goal_cell, start_cell, map_width, map_height, grid_res, use_bootstrap=True)
-            if path_cell is None:
-                #  path estimating: the map is not fully connected yet, but the demo still needs the returned answer.
-                path_odom = self.make_direct_odom_path(
-                    goal_odom,
-                    start_odom,
+        best = None
+        now = self.get_clock().now()
+        if self.global_id > 0 and len(self.start_pose_msgs) < self.global_id:
+            if now.nanoseconds >= self.next_final_path_status_time.nanoseconds:
+                #  final path waiting: starts come first, maps can arrive through local or merged topics.
+                self.get_logger().info(
+                    "final path waiting for robot starts "
+                    f"(robots={self.global_id}, starts={len(self.start_pose_msgs)})"
                 )
-                path_kind = "estimated"
-            else:
-                path_odom = [self.cell_to_odom(pt[0], pt[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res) for pt in path_cell]
-                path_kind = "planner"
-
-            length_m = self.path_length(path_odom)
-            candidate = {
-                "robot_id": robot_id,
-                "length_m": length_m,
-                "path_odom": path_odom,
-                "path_kind": path_kind,
-                "goal_odom": goal_odom,
-                "start_odom": start_odom,
-            }
-            if path_kind == "planner":
-                if best is None or length_m < best["length_m"]:
-                    best = candidate
-            elif best_estimated is None or length_m < best_estimated["length_m"]:
-                best_estimated = candidate
-
-        if best is None and best_estimated is not None:
-            first_goal_wall = min(self.goal_first_seen_wall_times.values()) if self.goal_first_seen_wall_times else time.monotonic()
-            if time.monotonic() - first_goal_wall >= FINAL_PATH_ESTIMATE_TIMEOUT_SEC:
-                best = best_estimated
-            elif now.nanoseconds >= self.next_final_path_status_time.nanoseconds:
-                #  A star waiting: final answer should be map-planned if the grid can connect in time.
-                self.get_logger().info("final path waiting for A* goal-to-start route")
                 self.next_final_path_status_time = now + Duration(seconds=2.0)
-                return False
+            return False
+
+        if not self.goal_approach_ready():
+            return False
+
+        candidates = self.merged_final_path_candidates()
+        if not candidates:
+            candidates = self.local_final_path_candidates()
+
+        for candidate in candidates:
+            if best is None or candidate["length_m"] < best["length_m"]:
+                best = candidate
 
         if best is None:
             if now.nanoseconds >= self.next_final_path_status_time.nanoseconds:
-                #  final path checking: target exists, but no robot has enough map/path data yet.
-                self.get_logger().info("final path waiting for a usable target-to-start candidate")
+                # final path waiting: do not publish a visual shortcut; the answer must come from A*.
+                self.get_logger().info(
+                    "final path waiting for a usable A* start-to-goal candidate "
+                    f"(local_maps={len(self.map_msgs)}, merged_map={self.merged_map_msg is not None})"
+                )
                 self.next_final_path_status_time = now + Duration(seconds=2.0)
             return False
 
@@ -966,20 +1189,27 @@ class Coordinator(Node):
 
         self.final_path_robot_id = best["robot_id"]
         self.final_path_length_m = best["length_m"]
-        self.final_path_msg = self.make_pose_array(best["robot_id"], best["path_odom"])
+        self.final_path_msg = self.make_pose_array(best["robot_id"], best["path_odom"], frame_id=best["frame_id"])
+        self.final_nav_path_msg = self.make_nav_path(best["robot_id"], best["path_odom"], frame_id=best["frame_id"])
+        self.write_final_path_outputs(best)
         self.get_logger().info(
-            f"GOAL FOUND: final {best['path_kind']} path uses robot_{best['robot_id']} start, "
-            f"path_length={best['length_m']:.2f} m, topic=/final_goal_to_start_path"
+            f"GOAL FOUND: final A* path starts at robot_{best['robot_id']}, "
+            f"path_length={best['length_m']:.2f} m, map_source={best['map_source']}, "
+            f"frame={best['frame_id']}, topic=/final_start_to_goal_path"
         )
         self.get_logger().info(
             "FINAL PATH ACQUIRED: "
             f"closest_start_robot=robot_{best['robot_id']}, "
             f"path_kind={best['path_kind']}, "
+            f"map_source={best['map_source']}, "
+            f"path_frame={best['frame_id']}, "
             f"path_length_m={best['length_m']:.2f}, "
             f"waypoints={len(best['path_odom'])}, "
-            f"goal_odom=({best['goal_odom'][0]:.2f}, {best['goal_odom'][1]:.2f}), "
             f"start_odom=({best['start_odom'][0]:.2f}, {best['start_odom'][1]:.2f}), "
-            "path_topic=/final_goal_to_start_path, stop_topic=/mission_complete"
+            f"goal_odom=({best['goal_odom'][0]:.2f}, {best['goal_odom'][1]:.2f}), "
+            "path_topic=/final_start_to_goal_path, nav_path_topic=/final_start_to_goal_nav_path, "
+            f"diagram={self.final_path_output_dir / 'final_start_to_goal_path.svg'}, "
+            "stop_topic=/mission_complete"
         )
         return True
 
@@ -1057,6 +1287,13 @@ class Coordinator(Node):
         now = self.get_clock().now()
         self.final_path_msg.header.stamp = now.to_msg()
         self.final_path_publisher.publish(self.final_path_msg)
+        self.legacy_final_path_publisher.publish(self.final_path_msg)
+        if self.final_nav_path_msg is not None:
+            self.final_nav_path_msg.header.stamp = now.to_msg()
+            for pose_stamped in self.final_nav_path_msg.poses:
+                pose_stamped.header.stamp = now.to_msg()
+            self.final_nav_path_publisher.publish(self.final_nav_path_msg)
+            self.legacy_final_nav_path_publisher.publish(self.final_nav_path_msg)
 
         done_msg = Bool()
         done_msg.data = True
@@ -1080,7 +1317,7 @@ class Coordinator(Node):
         return True
 
     def update_and_publish_final_goal_path(self, force=False):
-        """Update the target-to-start answer from callbacks that do not depend on a timer."""
+        """Update the final start-to-goal answer from callbacks that do not depend on a timer."""
         wall_now = time.monotonic()
         if self.goal_target_msgs and (force or wall_now >= self.next_final_path_attempt_wall_time):
             self.update_final_goal_path()

@@ -9,7 +9,7 @@ Mapping, local control, and planning/coordinator package for the multi-robot dem
 - builds a local occupancy grid from LiDAR scans,
 - publishes `/SLAM_map_<id>` and `/pose_<id>`,
 - follows coordinator paths from `/nav_path_<id>`,
-- performs local obstacle/stall recovery,
+- performs LiDAR clearance shaping plus local obstacle/stall recovery,
 - stops on `/mission_complete`.
 
 `coordinator.py` runs once globally. It:
@@ -18,16 +18,17 @@ Mapping, local control, and planning/coordinator package for the multi-robot dem
 - subscribes to each robot map, pose, heuristic point, and goal point,
 - chooses frontier paths while the goal is unknown,
 - switches both robots to goal-directed paths once the goal is seen,
-- publishes the final goal-to-start path on `/final_goal_to_start_path`,
+- publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`,
+- saves final path SVG/CSV artifacts under `/root/ros2_ws/src/final_path_results/`,
 - publishes `/mission_complete` and zero velocity commands when the answer is ready.
 
 ## Behavior
 
 - Unknown goal: robots explore frontier cells ranked by distance plus simulated raycast information gain, with heuristic bottle detections as soft search bias.
 - Goal seen: heuristic bias is disabled, and both robots receive goal-directed plans.
-- Obstacle/stall recovery: mappers back up, turn, and replan when motion stalls near obstacles.
+- Obstacle handling: mappers maintain LiDAR clearance while moving, then back up, turn, and replan if motion still stalls near obstacles.
 - Path following: each mapper clips new paths to the nearest remaining waypoint before driving.
-- Final answer: the coordinator chooses the shortest available path from the detected goal to a robot starting pose.
+- Final answer: the coordinator chooses the shortest available A* path from a robot starting pose to the detected goal.
 
 ## Mapping
 
@@ -42,6 +43,8 @@ This is an obstacle/map belief. It is not a target-belief map.
 
 ## Topics
 
+The mapper/coordinator interface uses flat ID-suffixed coordination topics. Robot hardware and CV topics use `/robot<id>/...` namespaces.
+
 Mapper output:
 
 ```text
@@ -54,8 +57,17 @@ Coordinator output:
 
 ```text
 /nav_path_<id>
-/final_goal_to_start_path
+/final_start_to_goal_path
+/final_start_to_goal_nav_path
 /mission_complete
+```
+
+Merged-map and registration topics:
+
+```text
+/new_robot_id
+/merged_map
+/merge_status
 ```
 
 CV inputs consumed by the coordinator:
@@ -96,6 +108,15 @@ Useful checks:
 
 ```bash
 ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
-ros2 topic echo --qos-durability transient_local --once /final_goal_to_start_path
+ros2 topic echo --qos-durability transient_local --once /merge_status
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
 ros2 topic echo --once /mission_complete
+```
+
+Final path files:
+
+```text
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
 ```

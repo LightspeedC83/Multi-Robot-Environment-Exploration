@@ -7,7 +7,8 @@ Panels:
         - /Global Options1
         - /Robot 1 SLAM Map1
         - /Merged Map1
-        - /Final Goal To Start Path1
+        - /Final Start To Goal Path1
+        - /Final Start To Goal Line1
         - /Robot 1 Goal Segmentation1
         - /Robot 2 Goal Segmentation1
       Splitter Ratio: 0.5
@@ -77,14 +78,38 @@ Visualization Manager:
       Value: false
     - Class: rviz_default_plugins/PoseArray
       Enabled: true
-      Name: Final Goal To Start Path
+      Name: Final Start To Goal Path
       Shape: Arrow (Flat)
       Topic:
         Depth: 1
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /final_goal_to_start_path
+        Value: /final_start_to_goal_path
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 37; 99; 235
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.08
+      Name: Final Start To Goal Line
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.05
+      Pose Color: 255; 85; 0
+      Pose Style: None
+      Radius: 0.03
+      Shaft Length: 0.1
+      Shaft Radius: 0.02
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /final_start_to_goal_nav_path
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true

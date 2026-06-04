@@ -70,6 +70,7 @@ def map_merger_node():
                 value_type=float,
             ),
             "map_topic_template": "/SLAM_map_{id}",
+            "map_topic_alias_templates": ["/{robot_id}/SLAM_map"],
         }],
     )
 

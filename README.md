@@ -1,14 +1,39 @@
 # Multi-Robot Environment Exploration
 
-Two robots explore an unknown Gazebo environment, build local occupancy-grid maps, use camera detections to find a visual goal, and return the shortest available path from the goal to the closest robot start position.
+Two robots explore an unknown Gazebo environment, build local occupancy-grid maps, use camera detections to find a visual goal, and return the shortest available path between the closest robot start position and the goal.
 
 ## Behavior
 
 - Each robot runs local mapping, obstacle avoidance, and frontier exploration.
 - Bottle detections are heuristic clues only before the goal is seen.
 - Once either robot sees the goal sphere, both robots switch to goal-directed motion and ignore heuristic clues.
-- The coordinator publishes the final goal-to-start path on `/final_goal_to_start_path`.
+- The coordinator publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`.
+- The coordinator saves final path evidence under `/root/ros2_ws/src/final_path_results/`.
 - When the final answer is available, `/mission_complete` stops robot motion.
+
+## Topic Convention
+
+Coordination topics use the flat `<name>_<id>` convention:
+
+```text
+/new_robot_id
+/SLAM_map_<id>
+/pose_<id>
+/id_active_<id>
+/nav_path_<id>
+```
+
+Robot hardware, sensor, and CV topics stay namespaced:
+
+```text
+/robot<id>/cmd_vel
+/robot<id>/scan
+/robot<id>/odom
+/robot<id>/goal_point_odom
+/robot<id>/heuristic_point_odom
+```
+
+New code should publish maps as `/SLAM_map_<id>`. The merger also listens to `/robot<id>/SLAM_map` as a compatibility alias for older branches, but that is not the project convention.
 
 ## Quickstart
 
@@ -53,7 +78,7 @@ source install/setup.bash
 rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
 ```
 
-The RViz config shows `/SLAM_map_1`, `/merged_map`, `/final_goal_to_start_path`, and goal debug images for both robots. `/SLAM_map_2` is included but disabled by default; enable it after map alignment or switch the fixed frame to `robot2/odom` to inspect robot 2 locally.
+The RViz config shows `/SLAM_map_1`, `/merged_map`, `/final_start_to_goal_path`, `/final_start_to_goal_nav_path`, and goal debug images for both robots. `/SLAM_map_2` is included but disabled by default; enable it after map alignment or switch the fixed frame to `robot2/odom` to inspect robot 2 locally.
 
 Open larger camera/debug views:
 
@@ -77,7 +102,9 @@ Useful terminal checks:
 ```bash
 ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
 ros2 topic echo --qos-durability transient_local --once /merged_map
-ros2 topic echo --qos-durability transient_local --once /final_goal_to_start_path
+ros2 topic echo --qos-durability transient_local --once /merge_status
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
 ros2 topic echo --once /mission_complete
 ```
 
@@ -85,6 +112,8 @@ Successful demo logs include:
 
 ```text
 FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., path_length_m=..., waypoints=...
+merged_map_published anchor=robot1 follower=robot2 confidence=...
+final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg, csv=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
 Mission complete received; stopping exploration
 ```
 

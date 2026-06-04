@@ -4,7 +4,7 @@ ROS2 node that wraps the coordinator module into the coordinating
 process described in the project proposal.
 
 Responsibilities:
-- subscribes to each robot's /SLAM_map (nav_msgs/OccupancyGrid) topic
+- subscribes to each robot's /SLAM_map_<id> (nav_msgs/OccupancyGrid) topic
 - tracks how many cells have changed from unknown -> known per robot
 - once a robot has converted N cells (TRANSFORM_RETRY_CELLS), attempts a
     new alignment between its grid and every other robot's grid
@@ -36,14 +36,15 @@ from merger import map_coordinator as mc
 
 DEFAULT_MERGED_MAP_TOPIC   = 'merged_map'
 DEFAULT_CONFIDENCE_THRESH  = 0.5
+DEFAULT_MERGE_STATUS_TOPIC = '/merge_status'
 TRANSFORM_RETRY_CELLS      = 500   # try to realign after this many new known cells
 MIN_CELLS_BEFORE_FIRST_TRY = 1000  # don't bother before either robot has seen this much
 
 # Time in seconds between coordination passes when no per-robot trigger fires.
 COORDINATION_PERIOD_SEC = 5.0
-MAP_SUBTOPIC = 'SLAM_map'
 ANCHOR_ROBOT_ID = 'robot1'
 DEFAULT_MAP_TOPIC_TEMPLATE = '/SLAM_map_{id}'
+DEFAULT_COMPAT_MAP_TOPIC_TEMPLATES = ['/{robot_id}/SLAM_map']
 
 # Helpers
 
@@ -102,6 +103,7 @@ class RobotMapState:
         self.resolution: Optional[float] = None
         self.origin_x: Optional[float] = None
         self.origin_y: Optional[float] = None
+        self.latest_topic: Optional[str] = None
         # Count of cells we've ever seen converted from -1 to known. Used to
         # decide when to retry alignment.
         self.cells_known: int = 0
@@ -134,7 +136,7 @@ def build_node():
     from nav_msgs.msg import OccupancyGrid
     from geometry_msgs.msg import TransformStamped
     from tf2_ros import StaticTransformBroadcaster
-    from std_msgs.msg import Int32
+    from std_msgs.msg import Int32, String
 
     class MapCoordinatorNode(Node):
         def __init__(self):
@@ -144,13 +146,15 @@ def build_node():
             self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
             self.declare_parameter('map_topic_template', DEFAULT_MAP_TOPIC_TEMPLATE)
             self.map_topic_template = str(self.get_parameter('map_topic_template').value)
+            self.declare_parameter('map_topic_alias_templates', DEFAULT_COMPAT_MAP_TOPIC_TEMPLATES)
+            self.map_topic_alias_templates = self._read_topic_alias_templates()
 
             self.robot_states: Dict[str, RobotMapState] = {}
             # Currently-known transforms between robot odom frames. Key:
             # (anchor_id, follower_id). Value: 2x3 affine in grid coords plus
             # the resolution it was solved at.
             self.known_transforms: Dict[Tuple[str, str], dict] = {}
-            self._map_subs = {} # robot_id -> subscription object
+            self._map_subs = {} # robot_id -> subscription object list
 
             qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
@@ -159,18 +163,27 @@ def build_node():
                 depth=1,
             )
             self._qos = qos
+            registration_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=20,
+            )
 
             # Listen for new robot registrations from controller node in mapper
             self._new_robot_sub = self.create_subscription(
                 Int32,
                 '/new_robot_id',
                 self._on_new_robot_registered,
-                10,
+                registration_qos,
             )
 
             # Publishers / broadcasters.
             self._merged_pub = self.create_publisher(
                 OccupancyGrid, DEFAULT_MERGED_MAP_TOPIC, qos,
+            )
+            self._status_pub = self.create_publisher(
+                String, DEFAULT_MERGE_STATUS_TOPIC, qos,
             )
             self._tf_broadcaster = StaticTransformBroadcaster(self)
 
@@ -182,6 +195,37 @@ def build_node():
 
             self.get_logger().info(f'map_coordinator ready, waiting for robots to register, '
                                    f'confidence_threshold={self.confidence_threshold}')
+            self.get_logger().info(
+                f'standard map topic template={self.map_topic_template}; '
+                f'compatibility aliases={self.map_topic_alias_templates}'
+            )
+
+        def _read_topic_alias_templates(self):
+            value = self.get_parameter('map_topic_alias_templates').value
+            if value is None:
+                return []
+            if isinstance(value, str):
+                return [value] if value else []
+            return [str(item) for item in value if str(item)]
+
+        def _topic_from_template(self, template, integer_id, robot_id):
+            topic = template.format(id=integer_id, robot_id=robot_id)
+            if not topic.startswith('/'):
+                topic = '/' + topic
+            return topic
+
+        def _map_topics_for_robot(self, integer_id, robot_id):
+            topics = []
+            for template in [self.map_topic_template] + self.map_topic_alias_templates:
+                topic = self._topic_from_template(template, integer_id, robot_id)
+                if topic not in topics:
+                    topics.append(topic)
+            return topics
+
+        def _publish_status(self, text):
+            msg = String()
+            msg.data = text
+            self._status_pub.publish(msg)
 
         # Subscribers
         def _on_new_robot_registered(self, msg: Int32):
@@ -196,17 +240,23 @@ def build_node():
             # Add state tracker for this robot
             self.robot_states[robot_id] = RobotMapState(robot_id)
 
-            # Subscribe to the mapper's global map topic, e.g. /SLAM_map_1.
-            topic = self.map_topic_template.format(id=integer_id, robot_id=robot_id)
-            self.get_logger().info(f'New robot registered: {robot_id}, subscribing to {topic}')
-
-            sub = self.create_subscription(
-                OccupancyGrid,
-                topic,
-                self._make_map_callback(robot_id),
-                self._qos,
+            # Topic subscription: /SLAM_map_1 is the standard, /robot1/SLAM_map is accepted
+            # as a compatibility alias so older branches do not starve the merger.
+            topics = self._map_topics_for_robot(integer_id, robot_id)
+            self.get_logger().info(
+                f'New robot registered: {robot_id}, subscribing to maps on {topics}'
             )
-            self._map_subs[robot_id] = sub      # hold reference to prevent GC
+
+            subs = []
+            for topic in topics:
+                sub = self.create_subscription(
+                    OccupancyGrid,
+                    topic,
+                    self._make_map_callback(robot_id, topic),
+                    self._qos,
+                )
+                subs.append(sub)
+            self._map_subs[robot_id] = subs      # hold references to prevent GC
 
             self.get_logger().info(
                 f'Now tracking {len(self.robot_states)} robot(s): '
@@ -214,10 +264,13 @@ def build_node():
             )
 
 
-        def _make_map_callback(self, robot_id):
+        def _make_map_callback(self, robot_id, source_topic):
             def cb(msg):
                 grid, res, ox, oy = occupancy_grid_msg_to_numpy(msg)
                 state = self.robot_states[robot_id]
+                if state.latest_topic != source_topic:
+                    state.latest_topic = source_topic
+                    self.get_logger().info(f'{robot_id} map stream active on {source_topic}')
                 state.update_from_grid(grid, res, ox, oy)
                 if state.should_attempt_alignment():
                     state.cells_known_at_last_alignment = state.cells_known
@@ -231,6 +284,9 @@ def build_node():
             ready = [rid for rid, s in self.robot_states.items()
                     if s.latest_grid is not None]
             if len(ready) < 2:
+                self._publish_status(
+                    f'waiting_for_maps ready={ready} expected={list(self.robot_states.keys())}'
+                )
                 return
 
             # Robot 1 is always the anchor when it participates, so the merged
@@ -278,6 +334,12 @@ def build_node():
             )
 
             if not result['success']:
+                self._publish_status(
+                    f'alignment_failed anchor={anchor_id} follower={follower_id} '
+                    f'confidence={result["confidence"]:.3f} '
+                    f'inliers={d.get("inliers", 0)} '
+                    f'wall_agree={d.get("wall_agreement", 0):.3f}'
+                )
                 return
 
             # Record the transform for downstream nodes.
@@ -323,6 +385,11 @@ def build_node():
                 stamp=self.get_clock().now().to_msg(),
             )
             self._merged_pub.publish(msg)
+            self._publish_status(
+                f'merged_map_published anchor={anchor_id} follower={follower_id} '
+                f'confidence={result["confidence"]:.3f} '
+                f'frame={anchor_id}/odom topic=/merged_map'
+            )
 
         def _broadcast_tf(self, anchor_id, follower_id, result):
             #Publish a static TF putting follower's odom frame inside anchor's odom frame.

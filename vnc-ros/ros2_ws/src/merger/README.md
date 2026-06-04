@@ -21,12 +21,15 @@ ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 /SLAM_map_<id>         nav_msgs/OccupancyGrid
 ```
 
-The node creates one map subscription per registered robot.
+The project convention is `/SLAM_map_<id>`, for example `/SLAM_map_1`. The node also accepts `/robot<id>/SLAM_map` as a compatibility alias so older branches do not starve the merger, but new code should not publish maps there.
+
+The node creates map subscriptions after receiving robot IDs. `/new_robot_id` uses transient-local QoS with enough history for both demo robots, so the merger can recover registrations even if it starts slightly late.
 
 ## Outputs
 
 ```text
 /merged_map            nav_msgs/OccupancyGrid
+/merge_status          std_msgs/String
 /tf_static             transform between robot odom frames after alignment
 ```
 
@@ -37,6 +40,7 @@ The node creates one map subscription per registered robot.
 ```text
 confidence_threshold   default: 0.5
 map_topic_template     default: /SLAM_map_{id}
+map_topic_alias_templates default: [/{robot_id}/SLAM_map]
 ```
 
 Example:
@@ -49,4 +53,5 @@ ros2 run merger map_merger_node --ros-args -p confidence_threshold:=0.7
 
 - Alignment is attempted periodically and after maps gain enough new known cells.
 - If confidence is too low, the node keeps publishing local maps separately and waits for more structure.
+- `/merge_status` reports whether the node is waiting for maps, rejected an alignment, or published a merged map.
 - In RViz, `/merged_map` appears once a successful alignment has been accepted.
