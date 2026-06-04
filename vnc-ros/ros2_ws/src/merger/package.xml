@@ -5,6 +5,7 @@
   <description>Map merger node for multi-robot exploration</description>
   <maintainer email="you@example.com">you</maintainer>
   <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
