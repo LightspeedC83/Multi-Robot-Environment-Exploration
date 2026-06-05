@@ -1451,27 +1451,3 @@ if __name__ == "__main__":
     
 
 
-# potentially useful code from past assignments....
-    # def rotate_angle(self, angle):
-    #     """This function rotates the robot an inputted angle (in radians) at self.angular_velocity"""
-    #     omega = self.ANGULAR_VELOCITY 
-    #     if angle < 0:
-    #         omega = -omega
-    #     elif angle==0: #dont' want a divide by zero error
-    #         return self.get_clock().now()
-
-    #     sleep_time = abs(angle/self.ANGULAR_VELOCITY)
-    #     duration = Duration(seconds=sleep_time)
-    #     self.move(0.0, omega) #turn
-    #     self.busy = True
-    #     return  self.get_clock().now() + duration
-
-
-    # def move_distance(self, distance):
-    #     """This function moves the robot for the inputted distance (in meters) at self.linear_velocity.
-    #     The relevant values are set to the motors, action_done time is updated"""
-    #     sleep_time = distance/self.LINEAR_VELOCITY
-    #     duration = Duration(seconds=sleep_time)
-    #     self.move(self.LINEAR_VELOCITY, 0.0)
-    #     self.busy = True
-    #     return  self.get_clock().now() + duration

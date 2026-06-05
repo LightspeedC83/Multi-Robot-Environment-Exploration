@@ -50,6 +50,7 @@ NEIGHBOR_LIST = [  # list of relative neighbors to a node
 
 
 PROTECTION_RADIUS = 0.3 # [m]
+
 HEURISTIC_KEEP_OUT_RADIUS = 0.9 # [m]
 HEURISTIC_NEAR_ROBOT_IGNORE_RADIUS = 1.25 # [m]
 HEURISTIC_FRONTIER_BIAS_WEIGHT = 0.18
@@ -113,6 +114,7 @@ class Coordinator(Node):
         self.pose_msgs = {} # dictionary that stores robot_id --> most recent pose msg received for that robot
         self.start_pose_msgs = {} # robot_id --> first pose we saw, used as that robot's start point
         self.ids_active = {} # dictionary that stores robot_id --> bool for if the robot is active or not
+        
         self.heuristic_target_msgs = {} # robot_id --> most recent heuristic clue point from CV
         self.goal_target_msgs = {} # robot_id --> most recent goal point from CV
         self.shared_goal_target_msg = None # most recent goal, reused by robots that did not see it themselves
@@ -177,6 +179,8 @@ class Coordinator(Node):
         self.merged_map_info = None
         self.merged_map = None
 
+        
+
     def handle_id_request(self, request, response):
         """This is the callback function to handle the server side of the GetUniqueID service"""
         self.global_id +=1 
@@ -212,6 +216,7 @@ class Coordinator(Node):
             self.get_logger().warn(f"received path request from robot with no ID {requester_id}")
             return response
 
+        # if goal found
         if self.goal_target_msgs:
             self.update_and_publish_final_goal_path(force=True)
             self.publish_stop_commands()
@@ -223,7 +228,7 @@ class Coordinator(Node):
             response.message = "goal found; holding motion while final A* path is computed"
             return response
 
-        # generating path
+        # if the last plan sent to robot was a goal approach path (ie. goal has been found, but we're not at it)
         if self.last_plan_kind.get(requester_id) == "goal" and requester_id in self.goal_approach_started_wall_times:
             goal_distance = self.get_robot_goal_distance(requester_id)
             if goal_distance is None or goal_distance <= GOAL_COMPLETION_ACCEPT_RADIUS_M:
@@ -247,8 +252,13 @@ class Coordinator(Node):
                 f"robot_{requester_id} consumed goal path but is still "
                 f"{goal_distance:.2f} m from the goal; re-anchoring"
             )
+        
 
-        result = self.single_robot_plan(requester_id)
+        # generating path
+        if not self.merged_map is None: # if we have a merged path
+            result = self.multi_robot_plan(requester_id)
+        else: # if we don't have a merged path
+            result = self.single_robot_plan(requester_id)
 
         # sending response
         if result == False:
@@ -1013,14 +1023,14 @@ class Coordinator(Node):
         return simplified
 
 
-    ### Code For Path Planning per robot ###
+    ### Code For Path Planning ###
     def single_robot_plan(self, robot_id):
         """broadcasts plans for frontier exploraiton of a single robot, returns true if path was broadcasted, false if no path found"""
         if self.final_path_msg is not None:
             self.publish_final_goal_path()
             return False
 
-        self.get_logger().info("starting map generation")
+        self.get_logger().info(f"starting single robot path generation for robot {robot_id}")
 
         if robot_id not in self.map_msgs:
             self.get_logger().warn(f"No map yet for robot {robot_id}")
@@ -1135,6 +1145,24 @@ class Coordinator(Node):
         self.get_logger().info(f"published nav path for robot_{robot_id} with {len(pose_arr_msg.poses)} waypoint(s)")
         self.update_and_publish_final_goal_path(force=True)
         return True
+
+
+    def multi_robot_plan(self, requester_id):
+        """gets a path for one robot, considering multi-robot exploration"""
+        
+        # getting positions of all robots
+        ids_to_assign = self.ids_active[::]
+
+        for id in self.ids_active:
+            
+        # getting a frontier list 
+
+        # getting frontier costs
+
+        # potential map
+
+        # lpfe
+
 
 
     def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell, robot_id=None, heuristic_cell=None, keepout_zones=None):
@@ -1613,6 +1641,8 @@ class Coordinator(Node):
         queue = deque()
         queue.append(start_cell)
         seen_cells[y_pos_map][x_pos_map] = True
+        wavefront_distances = {}
+        wavefront_distances[start_cell] = 0
         while len(queue) > 0:
             nextup = queue.popleft()
             if (self.is_frontier_cell(map, nextup[0], nextup[1], map_width, map_height)):
@@ -1624,28 +1654,38 @@ class Coordinator(Node):
                     if not seen_cells[y_n][x_n] and 0<=map[y_n][x_n]<MAP_CLEAR_THRESHOLD: # if point is unseen, explored, & unoccupied
                         queue.append((x_n, y_n)) # add neighbor to queue
                         seen_cells[y_n][x_n] = True # mark as visited
+                        wavefront_distances[(x_n, y_n)] = wavefront_distances[nextup] +1 # update wavefront distances
 
         # Frontier scoring: one raycast per cluster keeps exploration choices useful but cheap.
         clustered = np.zeros((map_height, map_width), dtype=bool)
+        cluster_wavefront_distances = {} # representative point keys to wavefront distances
         clusters = []
         for pt in frontier_points:
             if clustered[pt[1]][pt[0]]:
                 continue
 
             cluster = []
+            cluster_avg_wavefront = 0
             for other_pt in frontier_points:
                 if self.euclidean_distance(pt, other_pt) <= CLUSTER_CELL_RADIUS:
                     cluster.append(other_pt)
                     clustered[other_pt[1]][other_pt[0]] = True
-
+                    cluster_avg_wavefront += wavefront_distances[other_pt]
+            
+            if len(cluster) > 0: # getting average wavefront distance of this cluster
+                cluster_avg_wavefront = cluster_avg_wavefront / len(cluster)
+            else:
+                cluster_avg_wavefront = wavefront_distances[pt]
+            
             centroid_x = int(round(sum(p[0] for p in cluster) / len(cluster)))
             centroid_y = int(round(sum(p[1] for p in cluster) / len(cluster)))
             clusters.append((centroid_x, centroid_y, pt))
+            cluster_wavefront_distances[(centroid_x,centroid_y)] = cluster_avg_wavefront
 
         scored_frontiers = []
         for centroid_x, centroid_y, representative_pt in clusters:
             unknown_cells_visible = self.raycast_unknown_cells(centroid_x, centroid_y, map, map_width, map_height)
-            score = self.score_frontier(representative_pt, map, x_pos_map, y_pos_map, heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
+            score = self.score_frontier(representative_pt, map, x_pos_map, y_pos_map, wavefront_distance=cluster_wavefront_distances[(centroid_x,centroid_y)],  heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
             if math.isfinite(score):
                 score -= FRONTIER_RAYCAST_WEIGHT * unknown_cells_visible
                 scored_frontiers.append((representative_pt, score))
@@ -1677,12 +1717,16 @@ class Coordinator(Node):
 
         return len(visible_unknown)
 
-    def score_frontier(self, frontier_pt, map, x_cell_robot, y_cell_robot, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None):
+    def score_frontier(self, frontier_pt, map, x_cell_robot, y_cell_robot, wavefront_distance=None, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None):
         """Given a frontier point, this function outputs a score for that point"""
         # score by distance to start
-        distance_to_robot = math.sqrt((frontier_pt[0]-x_cell_robot)**2 + (frontier_pt[1]-y_cell_robot)**2)
+        if wavefront_distance is None: # if no wavefront distance, use euclidean distance
+            distance_to_robot = math.sqrt((frontier_pt[0]-x_cell_robot)**2 + (frontier_pt[1]-y_cell_robot)**2)
+        else: # use wavefront distance if provided
+            distance_to_robot = wavefront_distance
 
         score = distance_to_robot
+
         if heuristic_cell is not None:
             distance_to_hint = math.sqrt((frontier_pt[0]-heuristic_cell[0])**2 + (frontier_pt[1]-heuristic_cell[1])**2)
             score += HEURISTIC_FRONTIER_BIAS_WEIGHT * distance_to_hint
