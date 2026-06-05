@@ -78,6 +78,8 @@ CLUSTER_CELL_RADIUS = 5 # radius in cells to group frontier cells into clusters
 FRONTIER_RAYCAST_WEIGHT = 0.5 # weight for unknown cells visible in score equation
 FRONTIER_RAYCAST_RANGE_CELLS = 30 # max range in cells for raycast simulation
 FRONTIER_RAYCAST_ANGULAR_RESOLUTION = 10 # degrees between rays in raycast simulation
+
+MIN_COORDINATED_PATH_CALC_INTERVAL = 10 # minimum time between recalculating coordinated paths (seconds)
 # Topic names
 
 # Frequency at which the loop operates
@@ -114,7 +116,7 @@ class Coordinator(Node):
         self.pose_msgs = {} # dictionary that stores robot_id --> most recent pose msg received for that robot
         self.start_pose_msgs = {} # robot_id --> first pose we saw, used as that robot's start point
         self.ids_active = {} # dictionary that stores robot_id --> bool for if the robot is active or not
-        
+
         self.heuristic_target_msgs = {} # robot_id --> most recent heuristic clue point from CV
         self.goal_target_msgs = {} # robot_id --> most recent goal point from CV
         self.shared_goal_target_msg = None # most recent goal, reused by robots that did not see it themselves
@@ -139,6 +141,11 @@ class Coordinator(Node):
         self.last_path_msgs = {}
         self.next_nav_path_republish_wall_time = 0.0
         self.current_frontiers = {} # robot_id --> frontier cell currently being investigated
+
+        # multi-robot coordination variables
+        self.robot_coordinated_forntier_alloction = {} # id --> frontier point in merged map cell coordinates 
+        self.last_coordinated_path_calc_time = 0.0 # last time we ran multi-robot plan to get new set of frontiers
+        self.min_coordinated_path_calc_interval = MIN_COORDINATED_PATH_CALC_INTERVAL
 
         ## setting up unique ID service ##
         self.is_srv = self.create_service(GetUniqueID, 'get_unique_id', self.handle_id_request)
@@ -210,7 +217,7 @@ class Coordinator(Node):
         self.get_logger().info(f"requester_name: {request.requester_name}, requester_id: {requester_id}")
 
         #  if id is invalid
-        if requester_id <= 0 or requester_id is None:
+        if requester_id is None or requester_id <= 0:
             response.success = False
             response.message = "Requester has no id"
             self.get_logger().warn(f"received path request from robot with no ID {requester_id}")
@@ -255,10 +262,7 @@ class Coordinator(Node):
         
 
         # generating path
-        if not self.merged_map is None: # if we have a merged path
-            result = self.multi_robot_plan(requester_id)
-        else: # if we don't have a merged path
-            result = self.single_robot_plan(requester_id)
+        result = self.generate_and_publish_path(requester_id)
 
         # sending response
         if result == False:
@@ -270,6 +274,35 @@ class Coordinator(Node):
             response.message = f"{plan_kind} path published in nav_path_{requester_id}"
         
         return response
+
+
+    def generate_and_publish_path(self, requester_id):
+        """fucniton that for a robot, decides to do single or mult-robot planning, executes that, then publishes the path, returns boolean (True on success)"""
+
+        if not self.merged_map is None: # if we have a merged map
+            if time.monotonic() - self.last_coordinated_path_calc_time < self.min_coordinated_path_calc_interval: # if its been a short time since we last calculated multi-robot paths
+                path = self.get_coordinated_path_for_robot(requester_id)
+            else:
+                self.multi_robot_plan(requester_id)
+                path = self.get_coordinated_path_for_robot(requester_id)
+            
+            if path is None:
+                self.get_logger().warn(f"coordinated path unavailable for robot_{requester_id}; falling back to single robot plan")
+                result = self.single_robot_plan(requester_id) # if multi-robot doesn't get a path, fallback with single robot path
+            else:
+                if requester_id not in self.robot_coordinated_forntier_alloction: # if the requester id doens't ahve a coordinated frontier we do fallback of single robot plan
+                    return self.single_robot_plan(requester_id)
+                
+                self.current_frontiers[requester_id] = self.merged_cell_to_robot_cell(self.robot_coordinated_forntier_alloction[requester_id], requester_id)
+                self.last_path_msgs[requester_id] = path
+                self.publish_nav_path(requester_id, path)
+                self.last_plan_kind[requester_id] = "frontier"
+                result = True
+
+        else: # if we don't have a merged map
+            result = self.single_robot_plan(requester_id)
+        
+        return result
 
 
 
@@ -1148,26 +1181,142 @@ class Coordinator(Node):
 
 
     def multi_robot_plan(self, requester_id):
-        """gets a path for one robot, considering multi-robot exploration"""
-        # This function uses Lightweight Predictive Frontier Exploration (LPFE), an algorithm I found in this paper: https://ieeexplore.ieee.org/abstract/document/11303573
+        """updates all the assigned frontiers in self.robot_coordinated_forntier_alloction, considering lpfe multi-robot exploration
+        Returns True if frontiers assigned and updated in dictionary, False otherwise. Updates self.self.last_coordinated_path_calc_time on success"""
+        # This function is based on Lightweight Predictive Frontier Exploration (LPFE), an algorithm I found in this paper: https://ieeexplore.ieee.org/abstract/document/11303573
         # Credit for the LPFE algorithm: Athukorala et al.
+        
+        if self.merged_map is None: # if maps haven't been merged yet
+            return False
 
+        #getting map metadata
+        grid_res = self.merged_map_info.resolution
+        x_grid_origin = self.merged_map_info.origin.position.x
+        y_grid_origin = self.merged_map_info.origin.position.y
+        theta_grid_origin = self.quaternion_to_theta(self.merged_map_info.origin.orientation)
+  
         # getting positions of all robots
-        ids_to_assign = self.ids_active[::]
-        positions = {}
+        ids_to_assign = [id for id, active in self.ids_active.items() if active]     
+
+        map_positions = {}
         for id in ids_to_assign:
-            x,y,theta = self.unpack_pose_msg(self.pose_msgs[id])
-            positions[id] = (x,y)
+            if id not in self.pose_msgs:  # make sure the robot has published poses
+                continue
+            x, y, theta, _ = self.unpack_pose_msg(self.pose_msgs[id])
+            # transform into merged map frame (robot1/odom)
+            xy_in_merged = self.pose_xy_in_frame(self.pose_msgs[id], "robot1/odom", f"robot{id}/odom")
+            if xy_in_merged is None:
+                continue  # TF not available yet, skip this robot
+            x_merged, y_merged = xy_in_merged
+            cell_x, cell_y = self.odom_to_cell(x_merged, y_merged, x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
+            map_positions[id] = (cell_x, cell_y)
 
-        # getting a frontier list 
+        if requester_id not in map_positions:
+            return False
 
-        # getting frontier costs
+        ids_to_assign = [id for id in ids_to_assign if id in map_positions] # making sure that all ids are populated with positions
 
-        # potential map
+        # getting a frontier list from requester robot
+        x, y = map_positions[requester_id]
+        frontier_pts, requester_wf = self.get_frontier_points_and_wavefront_distances(self.merged_map, x, y, self.merged_map_info.width, self.merged_map_info.height)
+        _, _, _, information_gains = self.cluster_frontiers(self.merged_map, frontier_pts, requester_wf, self.merged_map_info.width, self.merged_map_info.height)
+        
+        # get wavefront distances from each robot's position to those frontiers
+        robot_wavefront_distances = {}
+        for id in map_positions.keys():
+            if id == requester_id:
+                robot_wavefront_distances[id] = requester_wf  # reuse, don't recompute
+                continue
+            rx, ry = map_positions[id]
+            _, wf_distances = self.get_frontier_points_and_wavefront_distances(self.merged_map, rx, ry, self.merged_map_info.width, self.merged_map_info.height)
+            robot_wavefront_distances[id] = wf_distances
 
-        # lpfe
+        # getting a potentials map for each cell for each robot, lpfe uses only wavefront distance, but here we modulate by infromation gain score
+        potentials = {} # potentials[id][frontier] give score for that frontier for that robot
+        LPFE_n_r = 0.3 / self.merged_map_info.resolution #( radius of 0.3m in map cell units )
+        LPFE_Q = 5
+        for id in ids_to_assign:
+            potentials[id] = {}
+            rx, ry = map_positions[id] # robot posiiton in map cells
+            for frontier in frontier_pts:
+                score = self.score_frontier(frontier, rx,ry, robot_wavefront_distances[id].get(frontier, float('inf')),
+                                            information_gain=information_gains.get(frontier, 0), map_res_m_per_cell=self.merged_map_info.resolution)
+                if self.euclidean_distance((rx,ry), frontier) < LPFE_n_r: # if frontier is too close to robot we add a constant to its score
+                    score += LPFE_Q
+
+                potentials[id][frontier] = score
+
+        # lpfe - find global minimum across all robots and frontiers, assign, update potentials
+        frontiers_assigned = {} # robot id --> frontier assigned to it
+        while len(ids_to_assign) > 0:
+            # find the lowest cost robot-frontier pair across all remaining robots
+            best_cost = math.inf
+            best_id = None
+            best_frontier = None
+            for id in ids_to_assign:
+                for frontier, cost in potentials[id].items():
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_id = id
+                        best_frontier = frontier
+            
+            if best_id is None:
+                break  # no reachable frontier found for any remaining robot
+
+            frontiers_assigned[best_id] = best_frontier # assign frontier to robot
+            ids_to_assign.remove(best_id) # remove robot from unassigned list
+
+            # update all other potentials based on this assignment (repulsion field)
+            safe_cost = max(best_cost, 1e-6)
+            for other_id in ids_to_assign:
+                for other_frontier in potentials[other_id]:
+                    potentials[other_id][other_frontier] /= safe_cost 
+
+        # now we have assigned frontiers to each robot
+        # update frontier assignments
+        for id in frontiers_assigned.keys():
+            self.robot_coordinated_forntier_alloction[id] = frontiers_assigned[id]
+        
+        if len(frontiers_assigned.keys()) >0: # only update time and return true if frontiers got assigned
+            self.last_coordinated_path_calc_time = time.monotonic()
+            return True
+        else: 
+            return False # no frontiers assigned
         
 
+    def get_coordinated_path_for_robot(self, robot_id):
+        """returns a pose array for robot with id entered from current locaiton to most recent frontier allocated to it"""
+        if robot_id not in self.robot_coordinated_forntier_alloction or robot_id not in self.pose_msgs: # if the robot doesn't have a frontier path allocated to it, we return NOne
+            return None
+        
+        # get robot position        
+        xy_in_merged = self.pose_xy_in_frame(self.pose_msgs[robot_id], "robot1/odom", f"robot{robot_id}/odom")
+        if xy_in_merged is None:
+            return None  # TF not available yet
+        x_merged, y_merged = xy_in_merged # in merged_map reference frame
+
+        x_grid_origin = self.merged_map_info.origin.position.x
+        y_grid_origin = self.merged_map_info.origin.position.y
+        theta_grid_origin = self.quaternion_to_theta(self.merged_map_info.origin.orientation)
+        grid_res = self.merged_map_info.resolution
+        cell_x, cell_y = self.odom_to_cell(x_merged, y_merged, x_grid_origin, y_grid_origin, theta_grid_origin, grid_res) # in merged_map cells
+
+        # get most recent frontier for this robot
+        goal_pt = self.robot_coordinated_forntier_alloction[robot_id]
+        path_cells = self.get_path_between_cells(self.merged_map, (cell_x, cell_y), goal_pt, self.merged_map_info.width, self.merged_map_info.height, grid_res)
+        if path_cells is None:
+            return None
+        
+        path_odom = []
+        for pt in path_cells:
+            x, y = self.cell_to_odom(pt[0], pt[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
+            xy_in_robot_frame = self.transform_xy_to_frame(x, y, "robot1/odom", f"robot{robot_id}/odom") # transf
+            if xy_in_robot_frame is None:
+                return None
+            path_odom.append(xy_in_robot_frame)
+
+        
+        return self.make_pose_array(robot_id, path_odom[1:], f"robot{robot_id}/odom")
 
 
     def get_frontier_path(self, map, x_pos_map, y_pos_map, map_width, map_height, map_res_m_per_cell, robot_id=None, heuristic_cell=None, keepout_zones=None):
@@ -1384,6 +1533,25 @@ class Coordinator(Node):
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
+
+    def merged_cell_to_robot_cell(self, cell, robot_id):
+        """Convert a merged map cell coordinate to a cell coordinate in a robot's individual SLAM map.
+        Returns None if transform is unavailable or robot has no map."""
+        if robot_id not in self.map_msgs:
+            return None
+
+        x_grid_origin = self.merged_map_info.origin.position.x
+        y_grid_origin = self.merged_map_info.origin.position.y
+        theta_grid_origin = self.quaternion_to_theta(self.merged_map_info.origin.orientation)
+        grid_res = self.merged_map_info.resolution
+
+        x_odom, y_odom = self.cell_to_odom(cell[0], cell[1], x_grid_origin, y_grid_origin, theta_grid_origin, grid_res)
+        xy_robot = self.transform_xy_to_frame(x_odom, y_odom, "robot1/odom", f"robot{robot_id}/odom")
+        if xy_robot is None:
+            return None
+
+        _, res, rx_origin, ry_origin, rtheta_origin, _, _, _ = self.unpack_map_msg(self.map_msgs[robot_id])
+        return self.odom_to_cell(xy_robot[0], xy_robot[1], rx_origin, ry_origin, rtheta_origin, res)
 
     def local_final_path_candidates(self):
         """Return local-map candidates as a fallback before a usable merge exists."""
@@ -1634,13 +1802,9 @@ class Coordinator(Node):
             return a_star_path
 
 
-    def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None, single_robot_plan=True):
-        """returns a list of (frontier_pt, score) sorted in lowest to highest, if single robot plan is true. 
-        
-        When single robot plan is False, this returns a list of frontier pts (x,y) and two dictionaries frontier pt --> wavefront distance, 
-        and frontier pt --> predicted infromation gain. returns fontier_pts, wavefront_distances, information_gains"""
-        keepout_zones = keepout_zones or []
-
+    def get_frontier_points_and_wavefront_distances(self, map, x_pos_map, y_pos_map, map_width, map_height):
+        """BFS from robot position to get frontier points and wavefront distances to all reachable cells.
+        Returns frontier_points (list of (x,y)) and wavefront_distances (dict of (x,y) --> distance)"""
         # do bfs from robot position on the map to get the list of the frontier points
         frontier_points = []
         seen_cells = np.zeros((map_height, map_width), dtype=bool) # I'll be using a 2D array to keep track of seen cells: True=visited; False=unvisited
@@ -1664,11 +1828,18 @@ class Coordinator(Node):
                         seen_cells[y_n][x_n] = True # mark as visited
                         wavefront_distances[(x_n, y_n)] = wavefront_distances[nextup] +1 # update wavefront distances
 
+        return frontier_points, wavefront_distances
+
+    def cluster_frontiers(self, map, frontier_points, wavefront_distances, map_width, map_height):
+        """Cluster frontier points and compute per-cluster information gains via raycast. Returns clusters list of (centroid_x, centroid_y, representative_pt),
+        cluster_wavefront_distances dict of (centroid_x, centroid_y) --> avg wavefront distance, centroid_to_frontier_pts dict of (centroid_x, centroid_y) --> list of frontier pts,
+        information_gains dict of frontier_pt --> unknown cells visible"""
         # Frontier scoring: one raycast per cluster keeps exploration choices useful but cheap.
         clustered = np.zeros((map_height, map_width), dtype=bool)
         cluster_wavefront_distances = {} # representative point keys to wavefront distances
         centroid_to_frontier_pts = {} # centroid to a list of the points that it's representing
         clusters = []
+        information_gains = {}
         for pt in frontier_points:
             if clustered[pt[1]][pt[0]]:
                 continue
@@ -1685,30 +1856,49 @@ class Coordinator(Node):
                 cluster_avg_wavefront = cluster_avg_wavefront / len(cluster)
             else:
                 cluster_avg_wavefront = wavefront_distances[pt]
+                cluster.append(pt)
             
             centroid_x = int(round(sum(p[0] for p in cluster) / len(cluster)))
             centroid_y = int(round(sum(p[1] for p in cluster) / len(cluster)))
             clusters.append((centroid_x, centroid_y, pt))
             cluster_wavefront_distances[(centroid_x,centroid_y)] = cluster_avg_wavefront
             represented_pts = cluster[::]
-            represented_pts.append(pt)
             centroid_to_frontier_pts[(centroid_x,centroid_y)] = represented_pts
+
+            # scoring each cluster by the information gain
+            unknown_cells_visible = self.raycast_unknown_cells(centroid_x, centroid_y, map, map_width, map_height)
+            for frontier_pt in represented_pts: # storing information gain per point
+                information_gains[frontier_pt] = unknown_cells_visible
+
+        return clusters, cluster_wavefront_distances, centroid_to_frontier_pts, information_gains
+
+    def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None, single_robot_plan=True):
+        """returns a list of (frontier_pt, score) sorted in lowest to highest, if single robot plan is true. 
+        When single robot plan is False, this returns a list of frontier pts (x,y) and two dictionaries frontier pt --> wavefront distance, 
+        and frontier pt --> predicted infromation gain. returns fontier_pts, wavefront_distances, information_gains"""
+        keepout_zones = keepout_zones or []
+
+        frontier_points, wavefront_distances = self.get_frontier_points_and_wavefront_distances(
+            map, x_pos_map, y_pos_map, map_width, map_height
+        )
+
+        clusters, cluster_wavefront_distances, centroid_to_frontier_pts, information_gains = self.cluster_frontiers(
+            map, frontier_points, wavefront_distances, map_width, map_height
+        )
 
         # scoring each cluster by the infromation gain
         scored_frontiers = []
-        information_gains = {}
         for centroid_x, centroid_y, representative_pt in clusters:
-            unknown_cells_visible = self.raycast_unknown_cells(centroid_x, centroid_y, map, map_width, map_height)
+            unknown_cells_visible = information_gains[representative_pt]
             
             if single_robot_plan == False:  # storing infromation gain per point for multi-robot
                 for pt in centroid_to_frontier_pts[centroid_x,centroid_y]:
                     information_gains[pt] = unknown_cells_visible
             else: # computing score for single_robot
-                score = self.score_frontier(representative_pt, map, x_pos_map, y_pos_map, wavefront_distance=cluster_wavefront_distances[(centroid_x,centroid_y)],  heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
+                score = self.score_frontier(representative_pt, x_pos_map, y_pos_map, wavefront_distance=cluster_wavefront_distances[(centroid_x,centroid_y)],
+                                            information_gain=unknown_cells_visible,  heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
                 if math.isfinite(score):
-                    score -= FRONTIER_RAYCAST_WEIGHT * unknown_cells_visible
                     scored_frontiers.append((representative_pt, score))
-
 
         if single_robot_plan: # retun ranked frontiers for single robot
             ranked_frontiers = sorted(scored_frontiers, key=lambda x: x[1]) # sorting the frontiers by the score (lowest to highest)
@@ -1741,7 +1931,7 @@ class Coordinator(Node):
 
         return len(visible_unknown)
 
-    def score_frontier(self, frontier_pt, map, x_cell_robot, y_cell_robot, wavefront_distance=None, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None):
+    def score_frontier(self, frontier_pt, x_cell_robot, y_cell_robot, wavefront_distance=None, information_gain=None, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None):
         """Given a frontier point, this function outputs a score for that point"""
         # score by distance to start
         if wavefront_distance is None: # if no wavefront distance, use euclidean distance
@@ -1750,6 +1940,9 @@ class Coordinator(Node):
             distance_to_robot = wavefront_distance
 
         score = distance_to_robot
+
+        if information_gain is not None:
+            score -= FRONTIER_RAYCAST_WEIGHT * information_gain
 
         if heuristic_cell is not None:
             distance_to_hint = math.sqrt((frontier_pt[0]-heuristic_cell[0])**2 + (frontier_pt[1]-heuristic_cell[1])**2)
@@ -1934,7 +2127,8 @@ class Coordinator(Node):
                 # Frontier refreshing: when the chosen edge fills in, ask for the next useful edge.
                 self.get_logger().info(f"old frontier for robot_{robot_id} filled in; searching for a new one")
                 self.current_frontiers[robot_id] = None
-                self.single_robot_plan(robot_id)
+                self.last_coordinated_path_calc_time = 0.0 # when the frontier is filled in, we want to redo our coordinated frontier calculations, to do so we set the last coordination calc time to 0 so the time interval guard doesn't use the old frontier
+                self.generate_and_publish_path(robot_id)
             
 
 

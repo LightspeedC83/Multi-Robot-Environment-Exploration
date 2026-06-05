@@ -107,7 +107,6 @@ rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
 
 Useful checks:
 
-<<<<<<< HEAD
 Click "Add" in the bottom left of the rviz2 screen
 Select "By topic" in the display that pops up
 Under "/SLAM_map" select "Map"
@@ -143,7 +142,7 @@ the coordinator runs 2 services:
 - probably offload recovery path calculations to the coordinator
 - if A* can't pathfind to the best frontier, we shouldn't just assume we're done, we should try with next best frontier, etc.
 - p
-=======
+
 ```bash
 ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
 ros2 topic echo --qos-durability transient_local --once /merge_status
@@ -152,7 +151,6 @@ ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav
 ros2 topic echo --qos-durability transient_local --once /final_result_markers
 ros2 topic echo --once /mission_complete
 ```
->>>>>>> d18f19b42aa519fe56bb8ee43dad93fffa661056
 
 Final path files:
 
