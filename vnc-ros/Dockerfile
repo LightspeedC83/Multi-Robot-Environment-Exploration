@@ -12,6 +12,9 @@ RUN apt-get -y update && apt-get install -y \
     nano \
     vim \
     htop \
+    python3-pip \
+    python3-opencv \
+    ros-${ROS_DISTRO}-cv-bridge \
     ros-${ROS_DISTRO}-ros-gz \
     ros-${ROS_DISTRO}-tf-transformations \
     ros-${ROS_DISTRO}-tf2-py \

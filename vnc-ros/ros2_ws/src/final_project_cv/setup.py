@@ -13,6 +13,7 @@ setup(
         (f"share/{package_name}", ["requirements_ros.txt"]),
         (f"share/{package_name}/models", glob("*.pt")),
         (f"share/{package_name}/launch", glob("launch/*.launch.py")),
+        (f"share/{package_name}/rviz", glob("rviz/*.rviz")),
         (f"share/{package_name}/worlds", glob("worlds/*.world")),
     ],
     install_requires=["setuptools"],

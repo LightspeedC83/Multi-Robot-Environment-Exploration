@@ -1,7 +1,149 @@
-# CS 81 Final Project
+# Multi-Robot Environment Exploration
 
-## Problem Statement:
-Robot A and B are exploring an unknown environment to find a goal location. The initial position of both these robots is arbitrary and their relation to each other is unknown. The robots must map the environment and find the goal location given a visual cue. Having multiple robots at different initial positions makes the search for the goal faster. The robots will return the optimal path from the goal to the closest (evaluated based on path length) starting point of one of the robots.
+Two robots explore an unknown Gazebo environment, build local occupancy-grid maps, use camera detections to find a visual goal, and return the shortest available path between the closest robot start position and the goal.
 
-## Motivating Application: 
-Robots could be exploring an unsafe, human-inaccessible environment (e.g. a structurally unsound building), trying to find a target (this could be a bomb or an injured person or whatever is making the building unsafe like a gas leak). The robots are put into the environment at different places to maximize efficiency of mapping. There is no time to rigorously define the robots injection locations. 
+## Behavior
+
+- Each robot runs local mapping, obstacle avoidance, and frontier exploration.
+- Bottle detections are heuristic clues only before the goal is seen.
+- Once either robot sees the goal sphere, heuristic clues are ignored and exploration motion freezes while the final A* answer is published.
+- The coordinator publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`.
+- The coordinator publishes final RViz markers on `/final_result_markers` for the chosen start, detected goal, and final path.
+- The coordinator saves final path evidence under `/root/ros2_ws/src/final_path_results/`.
+- When the final answer is available, `/mission_complete` stops robot motion.
+
+## Topic Convention
+
+Coordination topics use the flat `<name>_<id>` convention:
+
+```text
+/new_robot_id
+/SLAM_map_<id>
+/pose_<id>
+/id_active_<id>
+/nav_path_<id>
+```
+
+Robot hardware, sensor, and CV topics stay namespaced:
+
+```text
+/robot<id>/cmd_vel
+/robot<id>/scan
+/robot<id>/odom
+/robot<id>/goal_point_odom
+/robot<id>/heuristic_point_odom
+```
+
+New code should publish maps as `/SLAM_map_<id>`. The merger also listens to `/robot<id>/SLAM_map` as a compatibility alias for older branches, but that is not the project convention.
+
+## Quickstart
+
+Start Docker from the host:
+
+```bash
+cd /Users/emiliodaza/Dartmouth/Robotics/integrated-multi-robot/vnc-ros
+docker compose up -d
+docker compose exec ros bash
+```
+
+Open the visual desktop:
+
+```text
+http://localhost:8080/vnc.html
+```
+
+Run the integrated demo inside the ROS container:
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py
+```
+
+The launch defaults to `fresh_start:=true`, so stale Gazebo and ROS demo processes are cleared and the robots reload at the SDF start poses. To reuse an already-running Gazebo session:
+
+```bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
+```
+
+## Evidence Windows
+
+Open RViz for occupancy grids, TF, final path, and goal segmentation panels:
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
+```
+
+The RViz config shows `/SLAM_map_1`, `/merged_map`, `/final_start_to_goal_path`, `/final_start_to_goal_nav_path`, `/final_result_markers`, and goal debug images for both robots. `/SLAM_map_2` is included but disabled by default; enable it after map alignment or switch the fixed frame to `robot2/odom` to inspect robot 2 locally.
+
+Open larger camera/debug views:
+
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+Useful image topics:
+
+```text
+/robot1/camera/image_raw
+/robot1/heuristic_debug_image
+/robot1/goal_debug_image
+/robot2/camera/image_raw
+/robot2/heuristic_debug_image
+/robot2/goal_debug_image
+```
+
+Useful terminal checks:
+
+```bash
+ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
+ros2 topic echo --qos-durability transient_local --once /merged_map
+ros2 topic echo --qos-durability transient_local --once /merge_status
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
+ros2 topic echo --qos-durability transient_local --once /final_result_markers
+ros2 topic echo --once /mission_complete
+```
+
+Successful demo logs include:
+
+```text
+FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., path_length_m=..., waypoints=..., markers_topic=/final_result_markers
+merged_map_published anchor=robot1 follower=robot2 confidence=...
+final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg, csv=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv, map_png=/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
+Mission complete received; stopping exploration
+```
+
+Final report artifacts:
+
+```text
+/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
+/root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
+```
+
+## Packages
+
+- `final_project_cv`: Gazebo world, camera target detection, target localization, RViz config, integrated launch.
+- `mapper`: local occupancy mapping, robot control, coordinator, frontier/goal planning, final path publication.
+- `merger`: map alignment and merged occupancy-grid publication.
+- `mapper_interfaces`: ROS 2 services used by mappers and coordinator.
+
+## Reset
+
+If Gazebo or old nodes survive repeated launches, run inside the ROS container:
+
+```bash
+pkill -f '[m]apper.py' || true
+pkill -f '[c]oordinator.py' || true
+pkill -f '[m]ap_merger_node' || true
+pkill -9 gzserver || true
+pkill -9 gzclient || true
+pkill -9 gazebo || true
+```

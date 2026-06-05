@@ -15,6 +15,7 @@ __pycache__/
 ros2_ws/src/build/
 ros2_ws/src/install/
 ros2_ws/src/log/
+ros2_ws/src/final_path_results/
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/

@@ -1,111 +1,177 @@
-# ROS 2 Development Environment (Mac & Windows)
+# ROS 2 Docker Workspace
 
-This repository provides a containerized **ROS 2 Humble** environment with a virtual desktop (NoVNC) accessible via your web browser. This setup allows you to run GUI-based robotics tools like Gazebo and Rviz without needing a native Linux installation.
+This folder contains the Docker Compose environment used for the multi-robot exploration demo. It runs ROS 2 Humble, Gazebo, RViz, and a browser-accessible NoVNC desktop so the project can be developed from macOS or Windows without a native Linux install.
 
 ## Prerequisites
 
-Before following the instructions below, you must install **Docker Desktop**:
-* [Download for Mac](https://docs.docker.com/desktop/install/mac-install/)
-* [Download for Windows](https://docs.docker.com/desktop/install/windows-install/) (Ensure the **WSL 2 backend** is enabled in settings).
+- Docker Desktop
+- A browser for NoVNC
+- This repository checked out locally
 
----
+## Start The Container
 
-## 1. Setup
+From the host machine:
 
-Open a **Terminal** (Mac) or **PowerShell** (Windows) and follow these steps in order:
-
-### A. Clone the Repository
 ```bash
-git clone https://github.com/quattrinili/vnc-ros
-cd vnc-ros
+cd /Users/emiliodaza/Dartmouth/Robotics/integrated-multi-robot/vnc-ros
+docker compose build
+docker compose up -d
+docker compose exec ros bash
 ```
 
-### B. Ensure Local Workspace Exists
-The local `ros2_ws/src` folder is shared with the Docker container at `/root/ros2_ws/src` and is where you will write and edit your ROS packages.
+Open the desktop:
 
-If `ros2_ws/src` is already in the repository, you can skip this step.
-If it is missing, create it with:
-```bash
-mkdir -p ros2_ws/src
+```text
+http://localhost:8080/vnc.html
 ```
 
-### C. Launch the Containers
+## Build The Workspace
+
+Inside the ROS container:
+
 ```bash
-docker compose up
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
 ```
-*(Note: `ros.env` contains environment variables for ROS that can be modified before running this command.)*
 
----
+The host folder `vnc-ros/ros2_ws/src` is mounted into the container at `/root/ros2_ws/src`, so local edits are visible inside Docker.
 
-## 2. Running a ROS Gazebo Simulation
+## Topic Convention
 
-Once the terminal shows the following type of messages and remains running without errors:
-`vnc-ros-novnc-1 | ... INFO success: xterm entered RUNNING state`
+Coordination topics use flat IDs:
 
-### A. Access the Visual Desktop
-1. Open your web browser and navigate to: [http://localhost:8080/vnc.html](http://localhost:8080/vnc.html)
-2. Click **Connect**. You should see a Linux desktop environment.
+```text
+/new_robot_id
+/SLAM_map_<id>
+/pose_<id>
+/id_active_<id>
+/nav_path_<id>
+```
 
-### B. Launch the Simulation
-Open a **new (second) terminal window** on your host machine and run:
-1. **Enter the ROS container:**
-   ```bash
-   cd vnc-ros
-   docker compose exec ros bash
-   ```
-2. **Load the ROS environment:**
-   ```bash
-   source /opt/ros/humble/setup.bash
-   ```
-   *(This is already added in `.bashrc`, but we run it explicitly for clarity and reliability.)*
-3. **Launch the world:**
-   ```bash
-   ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
-   ```
-   *You can now see the robot in the web page opened in Step A.*
+Robot hardware, sensor, and CV topics use robot namespaces:
 
-### C. Teleoperate the Robot
-Open a **third terminal window** on your host machine and run:
-1. **Enter the ROS container:**
-   ```bash
-   cd vnc-ros
-   docker compose exec ros bash
-   ```
-2. **Load the ROS environment:**
-   ```bash
-   source /opt/ros/humble/setup.bash
-   ```
-3. **Run the teleop node:**
-   ```bash
-   ros2 run teleop_twist_keyboard teleop_twist_keyboard
-   ```
-   *Follow the on-screen instructions to drive the robot using your keyboard. Watch the robot move in your browser window.*
+```text
+/robot<id>/cmd_vel
+/robot<id>/scan
+/robot<id>/odom
+/robot<id>/goal_point_odom
+/robot<id>/heuristic_point_odom
+```
 
----
+Use `/SLAM_map_<id>` for mapper output. `/robot<id>/SLAM_map` is accepted only as a merger compatibility alias for older code.
 
-## 3. Termination
+## Run The Integrated Demo
 
-To properly stop the environment and clean up:
+Terminal 1, simulation and autonomy:
 
-1. In the **Simulation** and **Teleop** terminals: Press `Ctrl+C` to stop the active nodes, then type `exit` (or press `Ctrl+D`) to leave the container.
-2. In the **original terminal** (where `docker compose up` is running): Press `Ctrl+C`. You should see output indicating the containers are stopping:
-   ```text
-   Stopping vnc-ros-ros-1   ... done
-   Stopping vnc-ros-novnc-1 ... done
-   ```
-3. Once terminated, all terminal windows can be closed.
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py
+```
 
----
+The launch starts Gazebo, both robot mappers/controllers, the coordinator, map merger, and both CV pipelines. It defaults to `fresh_start:=true`, which clears stale Gazebo/demo processes before loading the world. To reuse an existing Gazebo session:
 
-## Development Notes
+```bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
+```
 
-### Editing your Workspace
-The `ros2_ws/src` folder on your machine is dynamically mapped to `/root/ros2_ws/src` inside the Docker container. You can use your favorite IDE (e.g., VS Code) on your host machine to edit your packages within this folder.
+Lower-load detection option:
 
-### Installing Additional Packages
-To add new dependencies to the environment:
-1. Edit the `Dockerfile` line that installs packages (`apt-get install`).
-2. Rebuild the container using the following command before running `docker compose up`:
-   ```bash
-   docker compose build
-   ```
+```bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=3 use_fastsam:=false
+```
+
+## Visual Evidence
+
+Terminal 2, RViz:
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
+```
+
+RViz shows:
+
+- `/SLAM_map_1` for robot 1's live occupancy grid.
+- `/merged_map` when map alignment has enough confidence.
+- `/final_start_to_goal_path` and `/final_start_to_goal_nav_path` after the final answer is available.
+- `/final_result_markers` for the chosen start, detected goal, and path overlay.
+- Goal segmentation image panels for both robot cameras.
+- `/SLAM_map_2` disabled by default; enable it after map alignment or switch fixed frame to `robot2/odom`.
+
+Terminal 3, optional larger image viewer:
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+Useful image topics:
+
+```text
+/robot1/camera/image_raw
+/robot1/heuristic_debug_image
+/robot1/goal_debug_image
+/robot2/camera/image_raw
+/robot2/heuristic_debug_image
+/robot2/goal_debug_image
+```
+
+## Useful Topics
+
+```bash
+ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
+ros2 topic echo --qos-durability transient_local --once /merged_map
+ros2 topic echo --qos-durability transient_local --once /merge_status
+ros2 topic echo /robot1/goal_point_odom
+ros2 topic echo /robot2/goal_point_odom
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
+ros2 topic echo --qos-durability transient_local --once /final_result_markers
+ros2 topic echo --once /mission_complete
+```
+
+Important terminal lines:
+
+```text
+Goal point for robot ... using ...
+cmd_vel publishing: linear=...
+merged_map_published anchor=robot1 follower=robot2 confidence=...
+GOAL FOUND: final A* path starts at robot_..., path_length=... m, map_source=...
+FINAL PATH ACQUIRED: closest_start_robot=robot_..., path_kind=..., map_source=..., path_frame=..., path_length_m=..., markers_topic=/final_result_markers
+final path artifacts saved: svg=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg, csv=/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv, map_png=/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
+Mission complete received; stopping exploration
+```
+
+## Behavior Summary
+
+- Robots explore frontiers while the goal is unknown.
+- Robot motion uses LiDAR clearance shaping while moving, so it slows and turns away before emergency recovery is needed.
+- Heuristic bottle detections bias frontier choice before goal detection.
+- As soon as a goal sphere is seen by either robot, heuristic bias is ignored and motion freezes while the final A* answer is published.
+- As soon as the final A* answer is available, motion stops.
+- The final returned path is the shortest A* route from a robot start to the detected goal, chosen by path length.
+
+## Reset
+
+If Gazebo or ROS nodes look stale after several launches:
+
+```bash
+pkill -f '[m]apper.py' || true
+pkill -f '[c]oordinator.py' || true
+pkill -f '[m]ap_merger_node' || true
+pkill -f '[v]ision_target_detector' || true
+pkill -f '[t]arget_localizer' || true
+pkill -9 gzserver || true
+pkill -9 gzclient || true
+pkill -9 gazebo || true
+```

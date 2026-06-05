@@ -25,9 +25,6 @@
 #   100   = occupied
 # (intermediate values allowed when probabilistic mapping is on)
 
-#Work by: Ajwa Shahid
-#Credit: AI was used to help create this file. 
-
 import math
 import numpy as np
 import cv2

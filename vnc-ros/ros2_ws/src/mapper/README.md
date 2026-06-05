@@ -1,72 +1,113 @@
-# Author: Charles Lowney 
-# Date: 5/10/26
+# mapper
 
-# Final project mapper(CS81)
+Mapping, local control, and planning/coordinator package for the multi-robot demo.
 
-## Description
-This code has a robot map its environment, generating and publishing occupancyGrid data that it creates
+## Nodes
 
+`mapper.py` runs once per robot. It:
 
-## How to execute 
+- builds a local occupancy grid from LiDAR scans,
+- publishes `/SLAM_map_<id>` and `/pose_<id>`,
+- follows coordinator paths from `/nav_path_<id>`,
+- performs LiDAR clearance shaping plus local obstacle/stall recovery,
+- stops on `/mission_complete`.
 
-In one terminal from ros2_ws\src:
-```bash
-docker compose up
+`coordinator.py` runs once globally. It:
+
+- assigns robot IDs through `/get_unique_id`,
+- subscribes to each robot map, pose, heuristic point, and goal point,
+- chooses frontier paths while the goal is unknown,
+- publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`,
+- publishes `/final_result_markers` for the chosen start, detected goal, and final path,
+- saves final path PNG/SVG/CSV artifacts under `/root/ros2_ws/src/final_path_results/`,
+- publishes `/mission_complete` and zero velocity commands when the answer is ready.
+
+## Behavior
+
+- Unknown goal: robots explore frontier cells ranked by distance plus simulated raycast information gain, with heuristic bottle detections as soft search bias.
+- Goal seen: heuristic bias is disabled, robot motion is held at zero, and the coordinator publishes the final A* answer.
+- Obstacle handling: mappers maintain LiDAR clearance while moving, then back up, turn, and replan if motion still stalls near obstacles.
+- Path following: each mapper clips new paths to the nearest remaining waypoint before driving.
+- Final answer: the coordinator chooses the shortest available A* path from a robot starting pose to the detected goal.
+
+## Mapping
+
+`PROBABILISTIC_MAPPING = True` enables log-odds occupancy updates. Published occupancy-grid values are:
+
+- `-1`: unknown,
+- `0`: likely free,
+- `1-99`: probabilistic occupancy belief,
+- `100`: occupied.
+
+This is an obstacle/map belief. It is not a target-belief map.
+
+## Topics
+
+The mapper/coordinator interface uses flat ID-suffixed coordination topics. Robot hardware and CV topics use `/robot<id>/...` namespaces.
+
+Mapper output:
+
+```text
+/SLAM_map_<id>
+/pose_<id>
+/id_active_<id>
 ```
 
-if docker had completely reset previously, and you need to install dependancies, run the following:
-```bash
-docker compose exec ros bash
-bash install_stage.sh && source ../install/setup.bash
-apt update
-apt install -y python3-pip
-pip3 install anytree
+Coordinator output:
+
+```text
+/nav_path_<id>
+/final_start_to_goal_path
+/final_start_to_goal_nav_path
+/final_result_markers
+/mission_complete
 ```
 
-you may also need to build the interface packages with:
+Merged-map and registration topics:
+
+```text
+/new_robot_id
+/merged_map
+/merge_status
+```
+
+CV inputs consumed by the coordinator:
+
+```text
+/robot1/heuristic_point_odom
+/robot1/goal_point_odom
+/robot2/heuristic_point_odom
+/robot2/goal_point_odom
+```
+
+## Services
+
+```text
+/get_unique_id        mapper_interfaces/srv/GetUniqueID
+/get_path             mapper_interfaces/srv/GetNewFrontierPath
+```
+
+## Run In Integrated Demo
+
+Use the project launch rather than starting mapper/coordinator manually:
+
 ```bash
-docker compose exec ros bash
 cd /root/ros2_ws
-colcon build
-```
-
-in another terminal:
-```bash
-docker compose exec ros bash
-ros2 launch stage_ros2 stage.launch.py world:=/root/ros2_ws/src/mapper/maze enforce_prefixes:=false one_tf_tree:=true
-```
-
-in another terminal:
-```bash
-docker compose exec ros bash
-python3 mapper/coordinator.py
-```
-
-in another terminal:
-```bash
-docker compose exec ros bash
-python3 mapper/mapper.py
-```
-
-go to http://localhost:8080/vnc.html to see simulation
-
-
-if you don't have the following line in the bash.rc file, you need to run this line every time you open a new ros2 terminal:
-```bash
 source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-## Visualizing the Map in rviz2
-ensure that the PA4.py code is running (see above section)
+For map evidence:
 
-in a separate terminal:
 ```bash
-docker compose exec ros bash
-rviz2
+rviz2 -d /root/ros2_ws/src/final_project_cv/rviz/integrated_demo.rviz
 ```
 
-Go to http://localhost:8080/vnc.html and you should see the rviz2 window. 
+Useful checks:
 
+<<<<<<< HEAD
 Click "Add" in the bottom left of the rviz2 screen
 Select "By topic" in the display that pops up
 Under "/SLAM_map" select "Map"
@@ -102,5 +143,22 @@ the coordinator runs 2 services:
 - probably offload recovery path calculations to the coordinator
 - if A* can't pathfind to the best frontier, we shouldn't just assume we're done, we should try with next best frontier, etc.
 - p
+=======
+```bash
+ros2 topic echo --qos-durability transient_local --once /SLAM_map_1
+ros2 topic echo --qos-durability transient_local --once /merge_status
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_path
+ros2 topic echo --qos-durability transient_local --once /final_start_to_goal_nav_path
+ros2 topic echo --qos-durability transient_local --once /final_result_markers
+ros2 topic echo --once /mission_complete
+```
+>>>>>>> d18f19b42aa519fe56bb8ee43dad93fffa661056
 
+Final path files:
 
+```text
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.svg
+/root/ros2_ws/src/final_path_results/final_start_to_goal_map.png
+/root/ros2_ws/src/final_path_results/final_start_to_goal_path.csv
+/root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
+```
