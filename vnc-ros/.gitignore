@@ -8,6 +8,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Downloaded ML weights
+*.pt
+
 # VS Code
 .vscode/
 

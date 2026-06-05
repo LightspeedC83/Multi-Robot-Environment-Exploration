@@ -7,7 +7,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import cv2
@@ -21,6 +21,7 @@ except ImportError as exc:  # pragma: no cover - this is a runtime help path.
 
 Point = Tuple[float, float]
 Color = Tuple[int, int, int]
+MapSnapshot = Dict[str, Any]
 
 BG: Color = (246, 245, 241)
 CARD: Color = (255, 255, 255)
@@ -243,11 +244,42 @@ def paste(base: np.ndarray, image: np.ndarray, x: int, y: int) -> None:
     base[y : y + h, x : x + w] = image
 
 
+def draw_swatch_legend(
+    image: np.ndarray,
+    items: Sequence[Tuple[str, Color]],
+    x: int,
+    y: int,
+    max_width: int,
+    scale: float = 0.40,
+) -> int:
+    cursor_x = x
+    cursor_y = y
+    row_height = 28
+    swatch = 16
+
+    for label, color in items:
+        item_width = swatch + 10 + text_width(label, scale) + 18
+        if cursor_x > x and cursor_x + item_width > x + max_width:
+            cursor_x = x
+            cursor_y += row_height
+
+        cv2.rectangle(image, (cursor_x, cursor_y - 14), (cursor_x + swatch, cursor_y + 2), color, -1)
+        cv2.rectangle(image, (cursor_x, cursor_y - 14), (cursor_x + swatch, cursor_y + 2), (118, 122, 128), 1)
+        write_text(image, label, cursor_x + swatch + 9, cursor_y + 2, scale=scale, color=INK)
+        cursor_x += item_width
+
+    return cursor_y + row_height - y
+
+
 def find_optional_image(results_dir: Path, filename: str) -> Optional[np.ndarray]:
+    return find_first_existing_image(results_dir, [filename])
+
+
+def find_first_existing_image(results_dir: Path, filenames: Sequence[str]) -> Optional[np.ndarray]:
     candidates = [
-        results_dir / "snapshots" / filename,
-        results_dir / "report_inputs" / filename,
-        results_dir / filename,
+        base / filename
+        for filename in filenames
+        for base in (results_dir / "snapshots", results_dir / "report_inputs", results_dir)
     ]
     for path in candidates:
         if path.exists():
@@ -269,14 +301,16 @@ def tile_image(
     accent: Color,
     missing_note: str,
     crop_source: bool = False,
+    legend_items: Optional[Sequence[Tuple[str, Color]]] = None,
 ) -> None:
     card(image, x, y, w, h)
     cv2.rectangle(image, (x, y), (x + w, y + 10), accent, -1)
     write_text(image, title, x + 22, y + 42, scale=0.62, color=INK, thickness=2)
 
-    image_top = y + 64
-    caption_h = 72
-    image_h = h - 88 - caption_h
+    image_top = y + 58 if crop_source else y + 64
+    caption_h = 54 if crop_source else 72
+    legend_h = 38 if legend_items else 0
+    image_h = h - (76 if crop_source else 88) - caption_h - legend_h
     image_w = w - 44
     cv2.rectangle(image, (x + 22, image_top), (x + 22 + image_w, image_top + image_h), (238, 239, 237), -1)
     cv2.rectangle(image, (x + 22, image_top), (x + 22 + image_w, image_top + image_h), LINE, 1)
@@ -302,6 +336,26 @@ def tile_image(
             color=MUTED,
         )
 
+    if legend_items:
+        legend_y = image_top + image_h + 29
+        write_text(
+            image,
+            "Legend:",
+            x + 28,
+            legend_y + 1,
+            scale=0.34,
+            color=INK,
+            thickness=1,
+        )
+        draw_swatch_legend(
+            image,
+            legend_items,
+            x + 92,
+            legend_y,
+            image_w - 76,
+            scale=0.34,
+        )
+
     draw_text_box(
         image,
         caption,
@@ -322,11 +376,25 @@ def crop_map_content(source: np.ndarray, margin: int = 28) -> np.ndarray:
     """Crop large unknown-map borders while keeping enough context for reports."""
     if source is None or source.size == 0:
         return source
-    gray_bg = np.array([170, 170, 170], dtype=np.int16)
-    diff = np.max(np.abs(source.astype(np.int16) - gray_bg), axis=2)
-    mask = diff > 18
+
+    gray_165 = np.array([165, 165, 165], dtype=np.int16)
+    gray_170 = np.array([170, 170, 170], dtype=np.int16)
+    source_i16 = source.astype(np.int16)
+    diff_165 = np.max(np.abs(source_i16 - gray_165), axis=2)
+    diff_170 = np.max(np.abs(source_i16 - gray_170), axis=2)
+    mask = np.minimum(diff_165, diff_170) > 18
     if not np.any(mask):
         return source
+
+    mask_u8 = mask.astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        largest_label = int(np.argmax(areas)) + 1
+        largest_area = int(stats[largest_label, cv2.CC_STAT_AREA])
+        total_area = int(np.count_nonzero(mask))
+        if largest_area >= max(40, int(0.25 * total_area)):
+            mask = labels == largest_label
 
     ys, xs = np.where(mask)
     y0 = max(0, int(ys.min()) - margin)
@@ -336,6 +404,264 @@ def crop_map_content(source: np.ndarray, margin: int = 28) -> np.ndarray:
     if (y1 - y0) < 20 or (x1 - x0) < 20:
         return source
     return source[y0:y1, x0:x1]
+
+
+def first_goal_image_name(robot_label: str, suffix: str) -> str:
+    return f"first_goal_{robot_label}_{suffix}.png"
+
+
+def find_first_goal_or_snapshot(results_dir: Path, robot_label: str, first_suffix: str, fallback_filename: str) -> Optional[np.ndarray]:
+    """Prefer the saved first-goal frame, then fall back to the finalizer snapshot."""
+    return find_first_existing_image(
+        results_dir,
+        [
+            first_goal_image_name(robot_label, first_suffix),
+            fallback_filename,
+        ],
+    )
+
+
+def load_map_snapshot(results_dir: Path, filename: str) -> Optional[MapSnapshot]:
+    raw_name = filename.replace(".png", ".npz")
+    for base in (results_dir / "snapshots", results_dir / "report_inputs", results_dir):
+        path = base / raw_name
+        if not path.exists():
+            continue
+        try:
+            data = np.load(str(path), allow_pickle=False)
+            return {
+                "grid": data["grid"].astype(np.int16),
+                "resolution": float(data["resolution"]),
+                "origin_x": float(data["origin_x"]),
+                "origin_y": float(data["origin_y"]),
+                "frame_id": str(data["frame_id"].item()),
+                "topic": str(data["topic"].item()) if "topic" in data.files else filename,
+            }
+        except Exception:
+            continue
+    return None
+
+
+def crop_grid_to_known_extent(grid: np.ndarray, padding: int = 10) -> np.ndarray:
+    known = grid >= 0
+    if not np.any(known):
+        return grid
+
+    #  Cropping choosing: use the full known envelope, not just walls, so free space stays visible.
+    ys, xs = np.where(known)
+    y0 = max(0, int(ys.min()) - padding)
+    y1 = min(grid.shape[0], int(ys.max()) + padding + 1)
+    x0 = max(0, int(xs.min()) - padding)
+    x1 = min(grid.shape[1], int(xs.max()) + padding + 1)
+    if (y1 - y0) < 8 or (x1 - x0) < 8:
+        return grid
+    return grid[y0:y1, x0:x1]
+
+
+def render_occupancy_array(grid: np.ndarray, crop: bool = True, max_side_px: int = 900) -> np.ndarray:
+    if grid is None or grid.size == 0:
+        return grid
+    if crop:
+        grid = crop_grid_to_known_extent(grid)
+
+    height, width = grid.shape
+    display_grid = np.flipud(grid)
+    image = np.full((height, width, 3), (170, 170, 170), dtype=np.uint8)
+    unknown = display_grid < 0
+    occupied = display_grid >= 80
+    known_free = (~unknown) & (~occupied)
+
+    image[unknown] = (165, 165, 165)
+    image[occupied] = (18, 28, 28)
+    if np.any(known_free):
+        values = np.clip(display_grid[known_free], 0, 79).astype(np.float32)
+        shade = (252 - values * 1.55).clip(130, 252).astype(np.uint8)
+        image[known_free] = np.stack([shade, shade, shade], axis=1)
+
+    scale = max(1, min(12, int(max_side_px / max(width, height, 1))))
+    return cv2.resize(image, (width * scale, height * scale), interpolation=cv2.INTER_NEAREST)
+
+
+def map_snapshot_or_image(results_dir: Path, filename: str) -> Optional[np.ndarray]:
+    snapshot = load_map_snapshot(results_dir, filename)
+    if snapshot is not None:
+        return render_occupancy_array(snapshot["grid"], crop=True)
+    return find_optional_image(results_dir, filename)
+
+
+def paste_mask(canvas: np.ndarray, mask: np.ndarray, x0: int, y0: int) -> None:
+    h, w = mask.shape
+    y_start = max(0, y0)
+    x_start = max(0, x0)
+    y_end = min(canvas.shape[0], y0 + h)
+    x_end = min(canvas.shape[1], x0 + w)
+    if y_end <= y_start or x_end <= x_start:
+        return
+    src_y0 = y_start - y0
+    src_x0 = x_start - x0
+    canvas[y_start:y_end, x_start:x_end] |= mask[src_y0:src_y0 + (y_end - y_start), src_x0:src_x0 + (x_end - x_start)]
+
+
+def contribution_legend_items(compact: bool = False) -> List[Tuple[str, Color]]:
+    if compact:
+        return [
+            ("R1 known", (209, 234, 212)),
+            ("R2 known", (238, 224, 198)),
+            ("overlap", (230, 216, 235)),
+            ("walls", (16, 25, 25)),
+            ("A* path", (235, 102, 45)),
+        ]
+
+    return [
+        ("robot 1 known", (209, 234, 212)),
+        ("robot 2 known", (238, 224, 198)),
+        ("overlap", (230, 216, 235)),
+        ("occupied", (16, 25, 25)),
+        ("A* path", (235, 102, 45)),
+    ]
+
+
+def draw_contribution_legend(image: np.ndarray, x: int, y: int, scale: float = 0.52) -> None:
+    cursor_x = x
+    for label, color in contribution_legend_items():
+        cv2.rectangle(image, (cursor_x, y - 16), (cursor_x + 22, y + 6), color, -1)
+        cv2.rectangle(image, (cursor_x, y - 16), (cursor_x + 22, y + 6), (120, 124, 130), 1)
+        write_text(image, label, cursor_x + 32, y + 4, scale=scale, color=INK)
+        cursor_x += max(168, text_width(label, scale) + 76)
+
+
+def render_merged_contribution_image(
+    results_dir: Path,
+    waypoints: Optional[Sequence[Point]] = None,
+    max_side_px: int = 1000,
+    include_legend: bool = False,
+) -> Optional[np.ndarray]:
+    r1 = load_map_snapshot(results_dir, "map_robot1_slam.png")
+    r2 = load_map_snapshot(results_dir, "map_robot2_slam.png")
+    if r1 is None or r2 is None:
+        return None
+
+    res = float(r1["resolution"])
+    if res <= 0 or abs(res - float(r2["resolution"])) > 1e-4:
+        return None
+
+    snapshots = [r1, r2]
+    min_x = min(float(s["origin_x"]) for s in snapshots)
+    min_y = min(float(s["origin_y"]) for s in snapshots)
+    max_x = max(float(s["origin_x"]) + s["grid"].shape[1] * res for s in snapshots)
+    max_y = max(float(s["origin_y"]) + s["grid"].shape[0] * res for s in snapshots)
+    width = max(1, int(math.ceil((max_x - min_x) / res)) + 1)
+    height = max(1, int(math.ceil((max_y - min_y) / res)) + 1)
+
+    known_1 = np.zeros((height, width), dtype=bool)
+    known_2 = np.zeros((height, width), dtype=bool)
+    occ_1 = np.zeros((height, width), dtype=bool)
+    occ_2 = np.zeros((height, width), dtype=bool)
+
+    for target_known, target_occ, snapshot in (
+        (known_1, occ_1, r1),
+        (known_2, occ_2, r2),
+    ):
+        grid = snapshot["grid"]
+        x0 = int(round((float(snapshot["origin_x"]) - min_x) / res))
+        y0 = int(round((float(snapshot["origin_y"]) - min_y) / res))
+        paste_mask(target_known, grid >= 0, x0, y0)
+        paste_mask(target_occ, grid >= 80, x0, y0)
+
+    union = known_1 | known_2 | occ_1 | occ_2
+    if not np.any(union):
+        return None
+
+    ys, xs = np.where(union)
+    pad = 8
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(height, int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(width, int(xs.max()) + pad + 1)
+    known_1 = known_1[y0:y1, x0:x1]
+    known_2 = known_2[y0:y1, x0:x1]
+    occ = (occ_1 | occ_2)[y0:y1, x0:x1]
+    cropped_origin_x = min_x + x0 * res
+    cropped_origin_y = min_y + y0 * res
+
+    h, w = known_1.shape
+    image = np.full((h, w, 3), (168, 168, 168), dtype=np.uint8)
+    only_1 = known_1 & ~known_2
+    only_2 = known_2 & ~known_1
+    overlap = known_1 & known_2
+    image[only_1] = (209, 234, 212)
+    image[only_2] = (238, 224, 198)
+    image[overlap] = (230, 216, 235)
+    image[occ] = (16, 25, 25)
+
+    display = np.flipud(image)
+    scale = max(1, min(12, int(max_side_px / max(w, h, 1))))
+    display = cv2.resize(display, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+
+    if waypoints:
+        def to_pixel(point: Point) -> Tuple[int, int]:
+            px = int(round((point[0] - cropped_origin_x) / res * scale))
+            py_grid = int(round((point[1] - cropped_origin_y) / res))
+            py = int((h - 1 - py_grid) * scale)
+            return px, py
+
+        pts = [to_pixel(pt) for pt in waypoints]
+        for start, end in zip(pts, pts[1:]):
+            cv2.line(display, start, end, (235, 102, 45), max(2, scale), cv2.LINE_AA)
+        if pts:
+            cv2.circle(display, pts[0], max(6, scale * 2), (78, 181, 88), -1, cv2.LINE_AA)
+            cv2.circle(display, pts[-1], max(7, scale * 2), (37, 136, 245), -1, cv2.LINE_AA)
+
+    if not include_legend:
+        return display
+
+    legend_h = 120
+    out = np.full((display.shape[0] + legend_h, display.shape[1], 3), (248, 248, 246), dtype=np.uint8)
+    paste(out, display, 0, legend_h)
+    draw_contribution_legend(out, 18, 52, scale=0.62)
+    return out
+
+
+def build_merged_contribution_figure(
+    results_dir: Path,
+    summary: Dict[str, str],
+    waypoints: Sequence[Point],
+) -> Optional[Path]:
+    merged = render_merged_contribution_image(results_dir, waypoints, max_side_px=1100)
+    if merged is None:
+        return None
+
+    output = make_canvas(1400, 980)
+    write_text(output, "Merged Map Contribution View", 44, 58, scale=1.05, thickness=2)
+    draw_text_box(
+        output,
+        "This redraws the local occupancy grids in one coordinate canvas so the map merge is visible: robot 1 contribution, robot 2 contribution, overlap, walls, and the final A* path.",
+        46,
+        96,
+        1180,
+        68,
+        scale=0.56,
+        color=MUTED,
+    )
+
+    card(output, 70, 175, 1260, 720, "Merged occupancy evidence")
+    draw_contribution_legend(output, 105, 255, scale=0.58)
+    fitted = resize_to_fit(merged, 1120, 470)
+    paste(output, fitted, 105 + (1120 - fitted.shape[1]) // 2, 315 + (470 - fitted.shape[0]) // 2)
+    draw_text_box(
+        output,
+        f"Path source: {summary.get('map_source', '?')} | length: {summary.get('path_length_m', '?')} m | frame: {summary.get('path_frame', '?')}",
+        105,
+        850,
+        1190,
+        42,
+        scale=0.52,
+        color=MUTED,
+    )
+
+    path = results_dir / "report_visuals" / "report_merged_contribution_map.png"
+    cv2.imwrite(str(path), output)
+    return path
 
 
 def parse_robot_id(summary: Dict[str, str]) -> str:
@@ -518,60 +844,79 @@ def build_cv_detection_evidence(results_dir: Path) -> Path:
         scale=0.56,
         color=MUTED,
     )
+    draw_swatch_legend(
+        output,
+        [
+            ("blue box = selected target", (255, 0, 0)),
+            ("yellow box = other visible detections", (0, 210, 255)),
+            ("red dot = centroid", (0, 0, 255)),
+            ("green mask = selected segment", (0, 180, 80)),
+        ],
+        46,
+        158,
+        1500,
+        scale=0.46,
+    )
 
     missing = "Run capture_report_snapshots.py while the integrated demo is active."
     tiles = [
         (
             "Robot 1 raw camera",
-            "cv_robot1_camera_raw.png",
+            find_first_goal_or_snapshot(results_dir, "robot1", "camera_raw", "cv_robot1_camera_raw.png"),
             "/robot1/camera/image_raw",
-            "Raw camera frame before detection.",
+            "Raw camera frame from the first stored goal sighting when available.",
             GREEN,
+            "Run the integrated demo until the goal detector saves first-goal evidence.",
         ),
         (
             "Robot 1 goal segmentation",
-            "cv_robot1_goal_debug.png",
+            find_first_goal_or_snapshot(results_dir, "robot1", "goal_debug", "cv_robot1_goal_debug.png"),
             "/robot1/goal_debug_image",
-            "Goal detector overlay with bounding box/centroid when the orange sphere is visible.",
+            "Goal detector overlay from the first stored goal sighting when available.",
             ORANGE,
+            placeholder_note("/robot1/goal_debug_image"),
         ),
         (
             "Robot 1 heuristic segmentation",
-            "cv_robot1_heuristic_debug.png",
+            find_optional_image(results_dir, "cv_robot1_heuristic_debug.png"),
             "/robot1/heuristic_debug_image",
             "Heuristic clue overlay for bottle detections before the goal is locked.",
             BLUE,
+            placeholder_note("/robot1/heuristic_debug_image"),
         ),
         (
             "Robot 2 raw camera",
-            "cv_robot2_camera_raw.png",
+            find_first_goal_or_snapshot(results_dir, "robot2", "camera_raw", "cv_robot2_camera_raw.png"),
             "/robot2/camera/image_raw",
-            "Second robot camera stream for independent exploration evidence.",
+            "Second robot camera stream, preferring first-goal evidence when robot 2 saw it.",
             GREEN,
+            "Run the integrated demo until the goal detector saves first-goal evidence.",
         ),
         (
             "Robot 2 goal segmentation",
-            "cv_robot2_goal_debug.png",
+            find_first_goal_or_snapshot(results_dir, "robot2", "goal_debug", "cv_robot2_goal_debug.png"),
             "/robot2/goal_debug_image",
-            "Second robot goal detector overlay.",
+            "Second robot goal detector overlay, preferring first-goal evidence.",
             ORANGE,
+            placeholder_note("/robot2/goal_debug_image"),
         ),
         (
             "Robot 2 heuristic segmentation",
-            "cv_robot2_heuristic_debug.png",
+            find_optional_image(results_dir, "cv_robot2_heuristic_debug.png"),
             "/robot2/heuristic_debug_image",
             "Second robot heuristic detector overlay.",
             BLUE,
+            placeholder_note("/robot2/heuristic_debug_image"),
         ),
     ]
     x_positions = [44, 600, 1156]
     y_positions = [190, 620]
-    for index, (title, filename, topic, caption, accent) in enumerate(tiles):
+    for index, (title, source_image, topic, caption, accent, missing_note) in enumerate(tiles):
         x = x_positions[index % 3]
         y = y_positions[index // 3]
         tile_image(
             output,
-            find_optional_image(results_dir, filename),
+            source_image,
             x,
             y,
             500,
@@ -579,7 +924,7 @@ def build_cv_detection_evidence(results_dir: Path) -> Path:
             title,
             f"{topic} | {caption}",
             accent,
-            missing if filename.endswith("camera_raw.png") else placeholder_note(topic),
+            missing_note or missing,
         )
 
     path = results_dir / "report_visuals" / "report_cv_detection_evidence.png"
@@ -591,8 +936,9 @@ def build_map_progression(
     results_dir: Path,
     summary: Dict[str, str],
     map_image: np.ndarray,
+    waypoints: Sequence[Point],
 ) -> Path:
-    output = make_canvas(1700, 1060)
+    output = make_canvas(1700, 1210)
     write_text(output, "Mapping And Final Path Progression", 44, 58, scale=1.05, thickness=2)
     draw_text_box(
         output,
@@ -606,13 +952,16 @@ def build_map_progression(
     )
 
     missing = "Run snapshot capture while this map topic is publishing."
+    merged_contribution = render_merged_contribution_image(results_dir, waypoints)
+    if merged_contribution is None:
+        merged_contribution = map_snapshot_or_image(results_dir, "map_merged.png")
     tile_image(
         output,
-        find_optional_image(results_dir, "map_robot1_slam.png"),
+        map_snapshot_or_image(results_dir, "map_robot1_slam.png"),
         44,
         185,
         780,
-        380,
+        450,
         "Robot 1 local map",
         "/SLAM_map_1 | Occupancy belief grid created from robot 1 LiDAR.",
         GREEN,
@@ -621,11 +970,11 @@ def build_map_progression(
     )
     tile_image(
         output,
-        find_optional_image(results_dir, "map_robot2_slam.png"),
+        map_snapshot_or_image(results_dir, "map_robot2_slam.png"),
         876,
         185,
         780,
-        380,
+        450,
         "Robot 2 local map",
         "/SLAM_map_2 | Independent occupancy belief grid from robot 2.",
         GREEN,
@@ -634,24 +983,25 @@ def build_map_progression(
     )
     tile_image(
         output,
-        find_optional_image(results_dir, "map_merged.png"),
+        merged_contribution,
         44,
-        620,
+        695,
         780,
-        380,
+        450,
         "Merged map",
-        "/merged_map | Map merger output when alignment confidence is high enough.",
+        "/merged_map | colored contribution view: robot 1, robot 2, overlap, walls, and A* path.",
         RED,
         missing,
-        crop_source=True,
+        crop_source=False,
+        legend_items=contribution_legend_items(compact=True),
     )
     tile_image(
         output,
         map_image,
         876,
-        620,
+        695,
         780,
-        380,
+        450,
         "Final A* answer",
         (
             f"{summary.get('map_source', '?')} | shortest path from "
@@ -663,52 +1013,6 @@ def build_map_progression(
     )
 
     path = results_dir / "report_visuals" / "report_map_progression.png"
-    cv2.imwrite(str(path), output)
-    return path
-
-
-def build_results_contact_sheet(results_dir: Path, visual_paths: Sequence[Path]) -> Path:
-    output = make_canvas(1800, 1320)
-    write_text(output, "Report Visual Results Pack", 44, 58, scale=1.08, thickness=2)
-    draw_text_box(
-        output,
-        "A compact index of the figures generated for the written report and demo explanation.",
-        46,
-        96,
-        1200,
-        60,
-        scale=0.56,
-        color=MUTED,
-    )
-
-    selected_names = [
-        "report_demo_evidence_panel.png",
-        "report_map_progression.png",
-        "report_cv_detection_evidence.png",
-        "report_waypoint_trace.png",
-        "report_system_flow.png",
-        "report_behavior_timeline.png",
-    ]
-    selected = [path for name in selected_names for path in visual_paths if path.name == name]
-    x_positions = [44, 624, 1204]
-    y_positions = [180, 730]
-    for index, path in enumerate(selected[:6]):
-        source = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        title = path.stem.replace("report_", "").replace("_", " ").title()
-        tile_image(
-            output,
-            source,
-            x_positions[index % 3],
-            y_positions[index // 3],
-            530,
-            500,
-            title,
-            path.name,
-            BLUE if index % 2 == 0 else DARK,
-            "Visual not generated.",
-        )
-
-    path = results_dir / "report_visuals" / "report_visual_results_pack.png"
     cv2.imwrite(str(path), output)
     return path
 
@@ -810,14 +1114,15 @@ def build_topic_flow(results_dir: Path) -> Path:
 
 
 def build_behavior_timeline(results_dir: Path) -> Path:
-    output = make_canvas(1500, 620)
+    output = make_canvas(1800, 650)
     write_text(output, "Demo Behavior Timeline", 44, 58, scale=1.08, thickness=2)
-    wrapped_text(
+    draw_text_box(
         output,
-        "Use this as the one-slide explanation of why the robots may stop before both physically touch the goal.",
+        "Mission sequence after exploration begins, visual evidence is accepted, and the final shortest path is returned.",
         46,
         96,
-        width_chars=105,
+        1300,
+        70,
         scale=0.56,
         color=MUTED,
     )
@@ -830,60 +1135,41 @@ def build_behavior_timeline(results_dir: Path) -> Path:
         ("5", "Return Answer", "A* chooses the shortest start-to-goal path", DARK),
     ]
     start_x, y = 70, 250
-    step_w, gap = 250, 35
+    step_w, gap = 300, 35
     for index, (num, title, body, accent) in enumerate(steps):
         x = start_x + index * (step_w + gap)
-        card(output, x, y, step_w, 220)
+        card(output, x, y, step_w, 235)
         cv2.circle(output, (x + 45, y + 55), 28, accent, -1, cv2.LINE_AA)
         write_text(output, num, x + 35, y + 65, scale=0.68, color=(255, 255, 255), thickness=2)
-        write_text(output, title, x + 82, y + 62, scale=0.66, color=INK, thickness=2)
-        wrapped_text(output, body, x + 26, y + 112, width_chars=25, scale=0.50, color=MUTED)
+        draw_text_box(
+            output,
+            title,
+            x + 82,
+            y + 62,
+            step_w - 110,
+            44,
+            scale=0.58,
+            color=INK,
+            thickness=2,
+            min_scale=0.40,
+        )
+        draw_text_box(
+            output,
+            body,
+            x + 26,
+            y + 122,
+            step_w - 52,
+            92,
+            scale=0.46,
+            color=MUTED,
+            min_scale=0.34,
+        )
         if index < len(steps) - 1:
             arrow(output, (x + step_w, y + 110), (x + step_w + gap, y + 110))
 
     path = results_dir / "report_visuals" / "report_behavior_timeline.png"
     cv2.imwrite(str(path), output)
     return path
-
-
-def write_index(results_dir: Path, outputs: Sequence[Path], summary: Dict[str, str]) -> Path:
-    index_path = results_dir / "report_visuals" / "report_visual_index.md"
-    lines = [
-        "# Report Visuals",
-        "",
-        "Generated from the final path artifacts produced by the coordinator.",
-        "",
-        "## Final Result",
-        "",
-        f"- Path length: {summary.get('path_length_m', '?')} m",
-        f"- Waypoints: {summary.get('waypoints', '?')}",
-        f"- Map source: {summary.get('map_source', '?')}",
-        f"- Path frame: {summary.get('path_frame', '?')}",
-        f"- Path kind: {summary.get('path_kind', '?')}",
-        "",
-        "## Files",
-        "",
-    ]
-    for output in outputs:
-        lines.append(f"- `{output.name}`")
-    lines.extend(
-        [
-            "",
-            "Suggested report usage:",
-            "",
-            "- `report_visual_results_pack.png`: contact sheet of the complete visual set.",
-            "- `report_demo_evidence_panel.png`: main result figure.",
-            "- `report_map_progression.png`: individual robot maps, merged map, and final A* result.",
-            "- `report_cv_detection_evidence.png`: camera and segmentation evidence from live ROS topics.",
-            "- `report_waypoint_trace.png`: clean A* waypoint/path figure.",
-            "- `report_system_flow.png`: architecture diagram.",
-            "- `report_topic_flow.png`: ROS evidence/topic diagram.",
-            "- `report_behavior_timeline.png`: short demo behavior explanation.",
-            "",
-        ]
-    )
-    index_path.write_text("\n".join(lines), encoding="utf-8")
-    return index_path
 
 
 def build_visuals(results_dir: Path) -> List[Path]:
@@ -909,15 +1195,16 @@ def build_visuals(results_dir: Path) -> List[Path]:
 
     outputs = [
         build_evidence_panel(results_dir, summary, waypoints, map_image),
-        build_map_progression(results_dir, summary, map_image),
+        build_map_progression(results_dir, summary, map_image, waypoints),
         build_cv_detection_evidence(results_dir),
         build_waypoint_trace(results_dir, summary, waypoints),
         build_system_flow(results_dir),
         build_topic_flow(results_dir),
         build_behavior_timeline(results_dir),
     ]
-    outputs.append(build_results_contact_sheet(results_dir, outputs))
-    outputs.append(write_index(results_dir, outputs, summary))
+    merged_contribution = build_merged_contribution_figure(results_dir, summary, waypoints)
+    if merged_contribution is not None:
+        outputs.insert(2, merged_contribution)
     return outputs
 
 

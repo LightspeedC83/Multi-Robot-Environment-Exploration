@@ -42,6 +42,51 @@ def coordinator_process():
                 "min_exploration_before_goal_sec:=",
                 LaunchConfiguration("min_exploration_before_goal_sec"),
             ],
+            "-p",
+            [
+                "max_exploration_before_goal_sec:=",
+                LaunchConfiguration("max_exploration_before_goal_sec"),
+            ],
+            "-p",
+            [
+                "min_local_map_known_ratio_before_goal:=",
+                LaunchConfiguration("min_local_map_known_ratio_before_goal"),
+            ],
+            "-p",
+            [
+                "min_local_map_known_cells_before_goal:=",
+                LaunchConfiguration("min_local_map_known_cells_before_goal"),
+            ],
+            "-p",
+            [
+                "goal_map_completion_roi_half_width_m:=",
+                LaunchConfiguration("goal_map_completion_roi_half_width_m"),
+            ],
+            "-p",
+            [
+                "goal_map_completion_roi_half_height_m:=",
+                LaunchConfiguration("goal_map_completion_roi_half_height_m"),
+            ],
+            "-p",
+            [
+                "min_goal_observations_before_acceptance:=",
+                LaunchConfiguration("min_goal_observations_before_acceptance"),
+            ],
+            "-p",
+            [
+                "goal_observation_cluster_radius_m:=",
+                LaunchConfiguration("goal_observation_cluster_radius_m"),
+            ],
+            "-p",
+            [
+                "goal_observation_window_sec:=",
+                LaunchConfiguration("goal_observation_window_sec"),
+            ],
+            "-p",
+            [
+                "goal_heuristic_rejection_radius_m:=",
+                LaunchConfiguration("goal_heuristic_rejection_radius_m"),
+            ],
         ],
         output="screen",
     )
@@ -55,6 +100,7 @@ def cleanup_previous_demo():
             (
                 "python3 /root/ros2_ws/src/final_project_cv/tools/cleanup_demo_processes.py --quiet; "
                 "/opt/ros/humble/bin/ros2 daemon stop || true; "
+                "rm -f /root/ros2_ws/src/final_path_results/snapshots/first_goal_*.png; "
                 "rm -f /root/.gazebo/gui.ini"
             ),
         ],
@@ -93,6 +139,10 @@ def map_merger_node():
             ),
             "map_topic_template": "/SLAM_map_{id}",
             "map_topic_alias_templates": ["/{robot_id}/SLAM_map"],
+            "use_metadata_origin_prior": ParameterValue(
+                LaunchConfiguration("use_metadata_origin_prior"),
+                value_type=bool,
+            ),
         }],
     )
 
@@ -130,6 +180,8 @@ def cv_pipeline(robot_namespace, pipeline_launch):
             "lidar_frame": f"{robot_namespace}/base_scan",
             "use_yolo": LaunchConfiguration("use_yolo"),
             "use_fastsam": LaunchConfiguration("use_fastsam"),
+            "process_width": LaunchConfiguration("process_width"),
+            "imgsz": LaunchConfiguration("imgsz"),
             "process_every_n": LaunchConfiguration("process_every_n"),
         }.items(),
     )
@@ -161,23 +213,38 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "confidence_threshold",
-            default_value="0.5",
+            default_value="0.68",
             description="Map-fusion confidence threshold.",
         ),
         DeclareLaunchArgument(
+            "use_metadata_origin_prior",
+            default_value="true",
+            description="Use OccupancyGrid origin metadata as a trusted demo prior for map fusion.",
+        ),
+        DeclareLaunchArgument(
             "use_yolo",
-            default_value="false",
-            description="Use YOLO weights instead of synthetic-color fallback detection.",
+            default_value="true",
+            description="Use YOLO weights for target detection.",
         ),
         DeclareLaunchArgument(
             "use_fastsam",
-            default_value="false",
-            description="Enable FastSAM mask refinement for CV target detection.",
+            default_value="true",
+            description="Use FastSAM mask refinement after YOLO target detection.",
         ),
         DeclareLaunchArgument(
             "process_every_n",
             default_value="2",
             description="Run CV on every nth camera frame.",
+        ),
+        DeclareLaunchArgument(
+            "process_width",
+            default_value="320",
+            description="Resize camera frames to this width before YOLO/FastSAM inference.",
+        ),
+        DeclareLaunchArgument(
+            "imgsz",
+            default_value="320",
+            description="YOLO/FastSAM inference size for the integrated demo.",
         ),
         DeclareLaunchArgument(
             "fresh_start",
@@ -190,13 +257,58 @@ def generate_launch_description():
             description="Hold early goal detections this long so frontier exploration is visible before final A* stop.",
         ),
         DeclareLaunchArgument(
+            "max_exploration_before_goal_sec",
+            default_value="105.0",
+            description="Finish with the best available map evidence after this cap even if coverage is imperfect.",
+        ),
+        DeclareLaunchArgument(
+            "min_local_map_known_ratio_before_goal",
+            default_value="0.70",
+            description="Required known-cell ratio inside the demo arena for each local map before finalizing.",
+        ),
+        DeclareLaunchArgument(
+            "min_local_map_known_cells_before_goal",
+            default_value="1000",
+            description="Required absolute known-cell count inside the demo arena for each local map before finalizing.",
+        ),
+        DeclareLaunchArgument(
+            "goal_map_completion_roi_half_width_m",
+            default_value="2.45",
+            description="Half-width of the arena region used for local-map completeness checks.",
+        ),
+        DeclareLaunchArgument(
+            "goal_map_completion_roi_half_height_m",
+            default_value="2.45",
+            description="Half-height of the arena region used for local-map completeness checks.",
+        ),
+        DeclareLaunchArgument(
+            "min_goal_observations_before_acceptance",
+            default_value="5",
+            description="Repeated clustered goal observations required before final path publication.",
+        ),
+        DeclareLaunchArgument(
+            "goal_observation_cluster_radius_m",
+            default_value="0.60",
+            description="Maximum spread for goal observations to count as the same detected sphere.",
+        ),
+        DeclareLaunchArgument(
+            "goal_observation_window_sec",
+            default_value="24.0",
+            description="Recent-observation window used by the stable goal filter.",
+        ),
+        DeclareLaunchArgument(
+            "goal_heuristic_rejection_radius_m",
+            default_value="0.38",
+            description="Reject stable goal clusters that sit directly on a heuristic bottle clue.",
+        ),
+        DeclareLaunchArgument(
             "auto_finalize",
             default_value="true",
             description="Capture report evidence, generate visuals, and end the launch after /mission_complete.",
         ),
         DeclareLaunchArgument(
             "finalizer_snapshot_seconds",
-            default_value="5.0",
+            default_value="8.0",
             description="Seconds to collect final map and CV snapshots after /mission_complete.",
         ),
         DeclareLaunchArgument(

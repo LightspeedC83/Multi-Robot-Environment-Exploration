@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture live ROS topic snapshots for the report visual pack."""
+"""Capture live ROS topic snapshots for report visual evidence."""
 
 from __future__ import annotations
 
@@ -42,11 +42,43 @@ def default_results_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "final_path_results"
 
 
+def crop_grid_to_known_component(grid: np.ndarray, padding: int = 12) -> np.ndarray:
+    """Crop to the main known map component so report panels do not waste space."""
+    known = grid != -1
+    if not np.any(known):
+        return grid
+
+    known_u8 = known.astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(known_u8, connectivity=8)
+    if num_labels <= 1:
+        return grid
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_label = int(np.argmax(areas)) + 1
+    largest_area = int(stats[largest_label, cv2.CC_STAT_AREA])
+    total_known = int(np.count_nonzero(known))
+    if largest_area < max(30, int(0.30 * total_known)):
+        component_mask = known
+    else:
+        component_mask = labels == largest_label
+
+    ys, xs = np.where(component_mask)
+    y0 = max(0, int(ys.min()) - padding)
+    y1 = min(grid.shape[0], int(ys.max()) + padding + 1)
+    x0 = max(0, int(xs.min()) - padding)
+    x1 = min(grid.shape[1], int(xs.max()) + padding + 1)
+    if (y1 - y0) < 8 or (x1 - x0) < 8:
+        return grid
+    return grid[y0:y1, x0:x1]
+
+
 def render_occupancy_grid(msg: OccupancyGrid) -> np.ndarray:
     """Convert nav_msgs/OccupancyGrid into a report-readable BGR image."""
     width = msg.info.width
     height = msg.info.height
     grid = np.array(msg.data, dtype=np.int16).reshape((height, width))
+    grid = crop_grid_to_known_component(grid)
+    height, width = grid.shape
     display_grid = np.flipud(grid)
     image = np.full((height, width, 3), (170, 170, 170), dtype=np.uint8)
 
@@ -67,6 +99,25 @@ def render_occupancy_grid(msg: OccupancyGrid) -> np.ndarray:
     return cv2.resize(image, (width * scale, height * scale), interpolation=cv2.INTER_NEAREST)
 
 
+def save_map_npz(msg: OccupancyGrid, path: Path, topic: str) -> None:
+    """Save the raw grid and metadata so report figures can be redrawn later."""
+    width = msg.info.width
+    height = msg.info.height
+    grid = np.array(msg.data, dtype=np.int16).reshape((height, width))
+    #  Map preserving: the PNG is for eyes; this NPZ keeps the actual coordinates.
+    np.savez_compressed(
+        str(path),
+        grid=grid,
+        resolution=np.array(float(msg.info.resolution), dtype=np.float32),
+        origin_x=np.array(float(msg.info.origin.position.x), dtype=np.float32),
+        origin_y=np.array(float(msg.info.origin.position.y), dtype=np.float32),
+        frame_id=np.array(msg.header.frame_id),
+        topic=np.array(topic),
+        stamp_sec=np.array(int(msg.header.stamp.sec), dtype=np.int64),
+        stamp_nanosec=np.array(int(msg.header.stamp.nanosec), dtype=np.int64),
+    )
+
+
 class SnapshotNode(Node):
     def __init__(self, output_dir: Path):
         super().__init__("report_snapshot_capture")
@@ -74,6 +125,14 @@ class SnapshotNode(Node):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.bridge = CvBridge()
         self.saved: Dict[str, Dict[str, str]] = {}
+
+        for filename in set(IMAGE_TOPICS.keys()) | set(MAP_TOPICS.keys()):
+            stale_path = self.output_dir / filename
+            if stale_path.exists():
+                stale_path.unlink()
+            stale_raw_path = self.output_dir / filename.replace(".png", ".npz")
+            if stale_raw_path.exists():
+                stale_raw_path.unlink()
 
         image_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -126,21 +185,26 @@ class SnapshotNode(Node):
         self.get_logger().info(f"saved {label}: {path}")
 
     def map_callback(self, msg: OccupancyGrid, filename: str, topic: str, label: str) -> None:
-        if self.already_saved(filename):
-            return
+        was_saved = self.already_saved(filename)
         image = render_occupancy_grid(msg)
         path = self.output_dir / filename
+        raw_path = self.output_dir / filename.replace(".png", ".npz")
         cv2.imwrite(str(path), image)
+        save_map_npz(msg, raw_path, topic)
         self.saved[filename] = {
             "topic": topic,
             "label": label,
             "path": str(path),
+            "raw_grid_path": str(raw_path),
             "frame_id": msg.header.frame_id,
             "resolution": f"{msg.info.resolution:.4f}",
+            "origin_x": f"{msg.info.origin.position.x:.4f}",
+            "origin_y": f"{msg.info.origin.position.y:.4f}",
             "width": str(msg.info.width),
             "height": str(msg.info.height),
         }
-        self.get_logger().info(f"saved {label}: {path}")
+        if not was_saved:
+            self.get_logger().info(f"saved {label}: {path}")
 
     def write_manifest(self) -> None:
         manifest_path = self.output_dir / "snapshot_manifest.json"

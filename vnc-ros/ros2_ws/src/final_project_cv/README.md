@@ -7,7 +7,7 @@ Computer-vision and simulation package for the integrated two-robot demo. It pro
 - `sports ball`: goal target.
 - `bottle`: heuristic clue used only before the goal is found.
 
-Once a goal observation exists, the coordinator ignores heuristic detections, holds robot motion, and publishes the final A* answer.
+Once a stable goal observation is accepted, the coordinator ignores heuristic detections, holds robot motion, and publishes the final A* answer.
 
 ## Detection And Localization
 
@@ -21,6 +21,8 @@ camera image
 ```
 
 The localizer prefers the LiDAR beam at the camera-centroid bearing when that range is consistent with the visual size estimate. If the beam is likely an obstacle or self-hit, it falls back to the visual estimate and logs the rejected LiDAR range.
+
+The integrated demo uses YOLO for both detector classes (`sports ball` and `bottle`), then FastSAM lazy-loads and refines the measurement with a learned mask when a target is selected. False final goals are handled downstream by stable goal clustering and rejection of goal clusters that sit on top of heuristic bottle clues.
 
 Example log:
 
@@ -72,13 +74,15 @@ source install/setup.bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-By default, early goal detections are held for `min_exploration_before_goal_sec:=45.0` seconds so the demo shows frontier exploration before the final A* stop. This is a minimum exploration window; after it passes, the demo still waits until the final A* answer exists, captures a few seconds of evidence, prints `RESULTS READY`, and exits. For a faster result:
+By default, early goal detections are held while both local maps mature. The final answer waits for `min_exploration_before_goal_sec:=45.0`, `min_local_map_known_ratio_before_goal:=0.70` inside the arena region, `min_goal_observations_before_acceptance:=5` stable clustered goal observations, and `goal_heuristic_rejection_radius_m:=0.38` so cap-like clusters on bottle clues are ignored. `max_exploration_before_goal_sec:=105.0` is the safety cap for map coverage. After the gate and stable-goal checks pass, the launch waits until the final A* answer exists, captures a few seconds of evidence, prints `RESULTS READY`, and exits. Short validation run:
 
 ```bash
-ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0 min_local_map_known_ratio_before_goal:=0.35 min_goal_observations_before_acceptance:=2
 ```
 
-The integrated launch also defaults to `auto_finalize:=true`: after `/mission_complete`, it captures final snapshots, regenerates the report visual pack, prints `RESULTS READY`, and shuts down. Use `auto_finalize:=false` for manual visualization sessions.
+The integrated launch also defaults to `auto_finalize:=true`: after `/mission_complete` or a non-empty final path on `/final_start_to_goal_path`, it captures final snapshots, regenerates report visuals, prints `RESULTS READY`, and shuts down. Use `auto_finalize:=false` for persistent visualization sessions.
+
+The detector also saves first-goal CV evidence under `/root/ros2_ws/src/final_path_results/snapshots/`, so the report can show the raw camera and goal overlay from the moment the goal was first observed.
 
 Gazebo world only:
 
@@ -95,7 +99,7 @@ ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py robot_names
 Lower-load integrated run:
 
 ```bash
-ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=3 use_fastsam:=false
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=4 process_width:=320 imgsz:=320
 ```
 
 ## Visualization
@@ -129,7 +133,7 @@ Camera overlays:
 ros2 run rqt_image_view rqt_image_view
 ```
 
-Useful debug topics:
+Camera evidence topics:
 
 ```text
 /robot1/goal_debug_image
@@ -155,4 +159,6 @@ python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
   --results-dir /root/ros2_ws/src/final_path_results
 ```
 
-The output folder is `/root/ros2_ws/src/final_path_results/report_visuals/` and includes the final result panel, map-progression panel, CV evidence panel, waypoint trace, system-flow diagram, topic-flow diagram, behavior timeline, contact sheet, and a small visual index.
+The snapshot capture writes map PNGs plus raw `.npz` occupancy grids. The `.npz` files let the visual generator redraw the merged contribution map with robot 1 cells, robot 2 cells, overlap, occupied cells, and the A* path separated by color.
+
+The output folder is `/root/ros2_ws/src/final_path_results/report_visuals/` and includes the final result panel, map-progression panel, merged-contribution map, CV evidence panel, waypoint trace, system-flow diagram, topic-flow diagram, and behavior timeline.
