@@ -1149,12 +1149,16 @@ class Coordinator(Node):
 
     def multi_robot_plan(self, requester_id):
         """gets a path for one robot, considering multi-robot exploration"""
-        
+        # This function uses Lightweight Predictive Frontier Exploration (LPFE), an algorithm I found in this paper: https://ieeexplore.ieee.org/abstract/document/11303573
+        # Credit for the LPFE algorithm: Athukorala et al.
+
         # getting positions of all robots
         ids_to_assign = self.ids_active[::]
+        positions = {}
+        for id in ids_to_assign:
+            x,y,theta = self.unpack_pose_msg(self.pose_msgs[id])
+            positions[id] = (x,y)
 
-        for id in self.ids_active:
-            
         # getting a frontier list 
 
         # getting frontier costs
@@ -1162,6 +1166,7 @@ class Coordinator(Node):
         # potential map
 
         # lpfe
+        
 
 
 
@@ -1629,8 +1634,11 @@ class Coordinator(Node):
             return a_star_path
 
 
-    def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None):
-        """returns a list of (frontier_pt, score) sorted in lowest to highest"""
+    def rank_frontiers(self, map, x_pos_map, y_pos_map, map_width, map_height, heuristic_cell=None, keepout_zones=None, map_res_m_per_cell=None, single_robot_plan=True):
+        """returns a list of (frontier_pt, score) sorted in lowest to highest, if single robot plan is true. 
+        
+        When single robot plan is False, this returns a list of frontier pts (x,y) and two dictionaries frontier pt --> wavefront distance, 
+        and frontier pt --> predicted infromation gain. returns fontier_pts, wavefront_distances, information_gains"""
         keepout_zones = keepout_zones or []
 
         # do bfs from robot position on the map to get the list of the frontier points
@@ -1659,6 +1667,7 @@ class Coordinator(Node):
         # Frontier scoring: one raycast per cluster keeps exploration choices useful but cheap.
         clustered = np.zeros((map_height, map_width), dtype=bool)
         cluster_wavefront_distances = {} # representative point keys to wavefront distances
+        centroid_to_frontier_pts = {} # centroid to a list of the points that it's representing
         clusters = []
         for pt in frontier_points:
             if clustered[pt[1]][pt[0]]:
@@ -1681,17 +1690,32 @@ class Coordinator(Node):
             centroid_y = int(round(sum(p[1] for p in cluster) / len(cluster)))
             clusters.append((centroid_x, centroid_y, pt))
             cluster_wavefront_distances[(centroid_x,centroid_y)] = cluster_avg_wavefront
+            represented_pts = cluster[::]
+            represented_pts.append(pt)
+            centroid_to_frontier_pts[(centroid_x,centroid_y)] = represented_pts
 
+        # scoring each cluster by the infromation gain
         scored_frontiers = []
+        information_gains = {}
         for centroid_x, centroid_y, representative_pt in clusters:
             unknown_cells_visible = self.raycast_unknown_cells(centroid_x, centroid_y, map, map_width, map_height)
-            score = self.score_frontier(representative_pt, map, x_pos_map, y_pos_map, wavefront_distance=cluster_wavefront_distances[(centroid_x,centroid_y)],  heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
-            if math.isfinite(score):
-                score -= FRONTIER_RAYCAST_WEIGHT * unknown_cells_visible
-                scored_frontiers.append((representative_pt, score))
+            
+            if single_robot_plan == False:  # storing infromation gain per point for multi-robot
+                for pt in centroid_to_frontier_pts[centroid_x,centroid_y]:
+                    information_gains[pt] = unknown_cells_visible
+            else: # computing score for single_robot
+                score = self.score_frontier(representative_pt, map, x_pos_map, y_pos_map, wavefront_distance=cluster_wavefront_distances[(centroid_x,centroid_y)],  heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
+                if math.isfinite(score):
+                    score -= FRONTIER_RAYCAST_WEIGHT * unknown_cells_visible
+                    scored_frontiers.append((representative_pt, score))
 
-        ranked_frontiers = sorted(scored_frontiers, key=lambda x: x[1]) # sorting the frontiers by the score (lowest to highest)
-        return ranked_frontiers
+
+        if single_robot_plan: # retun ranked frontiers for single robot
+            ranked_frontiers = sorted(scored_frontiers, key=lambda x: x[1]) # sorting the frontiers by the score (lowest to highest)
+            return ranked_frontiers
+        else: # return data on frontiers collected for multi-robot
+            frontier_wavefront_distances = { pt: wavefront_distances[pt] for pt in frontier_points if pt in wavefront_distances} # getting wavefront distances only for frontier points
+            return frontier_points, frontier_wavefront_distances, information_gains
 
     def raycast_unknown_cells(self, x, y, map, map_width, map_height, cluster_cell_radius=CLUSTER_CELL_RADIUS, raycast_range=FRONTIER_RAYCAST_RANGE_CELLS, angular_resolution=FRONTIER_RAYCAST_ANGULAR_RESOLUTION):
         """Simulate a 360 degree raycast from a frontier cluster and count visible unknown cells."""
