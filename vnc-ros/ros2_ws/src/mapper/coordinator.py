@@ -83,7 +83,8 @@ FRONTIER_RAYCAST_ANGULAR_RESOLUTION = 10 # degrees between rays in raycast simul
 FREQUENCY = 5 #Hz.
 
 USE_SIM_TIME = True
-STARTUP_TIMEOUT = 15.0 # s. Max wait for simulator/controller startup.
+STARTUP_TIMEOUT = 4.0 # s. Max wait for simulator/controller startup.
+DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC = 24.0 # demo breathing before an early camera hit freezes motion.
 
 
 class Coordinator(Node):
@@ -100,6 +101,16 @@ class Coordinator(Node):
             USE_SIM_TIME
         )
         self.set_parameters([use_sim_time_param])
+
+        self.declare_parameter("min_exploration_before_goal_sec", DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC)
+        self.min_exploration_before_goal_sec = max(
+            0.0,
+            float(self.get_parameter("min_exploration_before_goal_sec").value),
+        )
+        self.goal_gate_start_wall_time = time.monotonic()
+        self.pending_goal_target_msgs = {} # robot_id --> goal observations held while maps get some motion
+        self.pending_shared_goal_target_msg = None
+        self.next_goal_gate_log_wall_time = 0.0
 
 
         ## top level parameters ##
@@ -211,6 +222,8 @@ class Coordinator(Node):
             response.message = "Requester has no id"
             self.get_logger().warn(f"received path request from robot with no ID {requester_id}")
             return response
+
+        self.accept_pending_goal_if_ready()
 
         if self.goal_target_msgs:
             self.update_and_publish_final_goal_path(force=True)
@@ -339,21 +352,59 @@ class Coordinator(Node):
     def _target_callback(self, msg:PointStamped, robot_id:int, target_kind:str):
         """Store target observations so planner requests can use the latest CV hint."""
         if target_kind == "goal":
-            self.goal_target_msgs[robot_id] = msg
-            self.shared_goal_target_msg = msg
-            self.goal_first_seen_wall_times.setdefault(robot_id, time.monotonic())
-            if robot_id not in self.goal_seen_logged:
-                #  goal noticing: one log is enough, the camera publishes this fast.
-                self.get_logger().info(
-                    f"goal observation from robot_{robot_id}: "
-                    f"({msg.point.x:.2f}, {msg.point.y:.2f})"
-                )
-                self.goal_seen_logged.add(robot_id)
-            #  goal locking: once the real sphere exists, stop search motion and compute the answer.
+            if not self.goal_acceptance_gate_open():
+                self.pending_goal_target_msgs[robot_id] = msg
+                self.pending_shared_goal_target_msg = msg
+                wall_now = time.monotonic()
+                if wall_now >= self.next_goal_gate_log_wall_time:
+                    elapsed = wall_now - self.goal_gate_start_wall_time
+                    remaining = max(0.0, self.min_exploration_before_goal_sec - elapsed)
+                    #  exploration first: the ball can be visible at spawn, but the video needs mapping motion.
+                    self.get_logger().info(
+                        "holding early goal observation while frontier exploration starts "
+                        f"(remaining={remaining:.1f}s, robot_{robot_id}=({msg.point.x:.2f}, {msg.point.y:.2f}))"
+                    )
+                    self.next_goal_gate_log_wall_time = wall_now + 2.0
+                return
+
+            self.store_goal_observation(msg, robot_id)
+            #  goal locking: once the real sphere is accepted, stop search motion and compute the answer.
             self.publish_stop_commands()
         else:
             self.heuristic_target_msgs[robot_id] = msg
         self.update_and_publish_final_goal_path()
+
+    def goal_acceptance_gate_open(self):
+        """Return true once the demo has had enough time to show exploration."""
+        elapsed = time.monotonic() - self.goal_gate_start_wall_time
+        return elapsed >= self.min_exploration_before_goal_sec
+
+    def store_goal_observation(self, msg, robot_id):
+        """Remember an accepted goal observation and share it across robots."""
+        self.goal_target_msgs[robot_id] = msg
+        self.shared_goal_target_msg = msg
+        self.goal_first_seen_wall_times.setdefault(robot_id, time.monotonic())
+        if robot_id not in self.goal_seen_logged:
+            #  goal noticing: one log is enough, the camera publishes this fast.
+            self.get_logger().info(
+                f"goal observation from robot_{robot_id}: "
+                f"({msg.point.x:.2f}, {msg.point.y:.2f})"
+            )
+            self.goal_seen_logged.add(robot_id)
+
+    def accept_pending_goal_if_ready(self):
+        """Promote held goal observations after the exploration window opens."""
+        if not self.pending_goal_target_msgs or not self.goal_acceptance_gate_open():
+            return False
+
+        for pending_robot_id, pending_msg in list(self.pending_goal_target_msgs.items()):
+            #   Goal promoting: use the most recent camera/lidar point after maps have moved.
+            self.store_goal_observation(pending_msg, pending_robot_id)
+
+        self.pending_goal_target_msgs.clear()
+        self.pending_shared_goal_target_msg = None
+        self.update_and_publish_final_goal_path(force=True)
+        return True
 
     def get_goal_target_for_robot(self, robot_id):
         """Return this robot's own goal, or the shared demo goal if another robot saw it."""
@@ -1831,6 +1882,7 @@ class Coordinator(Node):
 
     def _control_loop_callback(self): # will be called every self.delta_t seconds 
         wall_now = time.monotonic()
+        self.accept_pending_goal_if_ready()
         if self.final_path_msg is None and self.last_path_msgs and wall_now >= self.next_nav_path_republish_wall_time:
             #  path rebroadcasting: late subscribers should still get a waypoint.
             for robot_id, pose_arr_msg in self.last_path_msgs.items():

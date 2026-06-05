@@ -87,7 +87,7 @@ STUCK_WATCHDOG_SEC = 2.2 # [s]
 MISSION_STOP_BURST_SEC = 3.0 # [s] repeated zero commands after final answer latching
 
 USE_SIM_TIME = True
-STARTUP_TIMEOUT = 15.0 # s. Max wait for simulator/controller startup.
+STARTUP_TIMEOUT = 4.0 # s. Max wait for simulator/controller startup.
 
 class fsm(Enum):
     OFF = 0

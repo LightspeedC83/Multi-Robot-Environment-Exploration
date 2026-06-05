@@ -72,6 +72,12 @@ source install/setup.bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
+By default, early goal detections are held for `min_exploration_before_goal_sec:=24.0` seconds so the demo shows frontier exploration before the final A* stop. For a faster result:
+
+```bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0
+```
+
 Gazebo world only:
 
 ```bash

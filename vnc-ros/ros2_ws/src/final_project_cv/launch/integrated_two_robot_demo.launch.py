@@ -31,7 +31,16 @@ def mapper_process(robot_namespace):
 
 def coordinator_process():
     return ExecuteProcess(
-        cmd=["python3", LaunchConfiguration("coordinator_script")],
+        cmd=[
+            "python3",
+            LaunchConfiguration("coordinator_script"),
+            "--ros-args",
+            "-p",
+            [
+                "min_exploration_before_goal_sec:=",
+                LaunchConfiguration("min_exploration_before_goal_sec"),
+            ],
+        ],
         output="screen",
     )
 
@@ -138,6 +147,11 @@ def generate_launch_description():
             "fresh_start",
             default_value="true",
             description="Kill stale Gazebo/demo nodes before loading the world so robot poses reset.",
+        ),
+        DeclareLaunchArgument(
+            "min_exploration_before_goal_sec",
+            default_value="24.0",
+            description="Hold early goal detections this long so frontier exploration is visible before final A* stop.",
         ),
         #  gazebo reloading: old GUI sessions keep model poses, so clean them before a new take.
         cleanup_previous_demo(),
