@@ -25,7 +25,7 @@ Mapping, local control, and planning/coordinator package for the multi-robot dem
 ## Behavior
 
 - Unknown goal: robots explore frontier cells ranked by distance plus simulated raycast information gain, with heuristic bottle detections as soft search bias.
-- Goal seen: heuristic bias is disabled, robot motion is held at zero, and the coordinator publishes the final A* answer.
+- Goal candidate seen: the coordinator waits for repeated stable goal observations, rejects clusters sitting directly on bottle clues, disables heuristic bias, and publishes the final A* answer.
 - Obstacle handling: mappers maintain LiDAR clearance while moving, then back up, turn, and replan if motion still stalls near obstacles.
 - Path following: each mapper clips new paths to the nearest remaining waypoint before driving.
 - Final answer: the coordinator chooses the shortest available A* path from a robot starting pose to the detected goal.
@@ -99,7 +99,7 @@ source install/setup.bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-The integrated launch holds early goal observations for `min_exploration_before_goal_sec:=45.0` seconds. During that minimum window the coordinator still serves frontier paths, so map growth is visible before the final shortest A* path is published, `/mission_complete` stops the robots, and the finalizer writes report evidence.
+The integrated launch holds early goal observations while local maps mature. During that gate the coordinator still serves frontier paths, so map growth is visible before the final shortest A* path is published. Defaults are `min_exploration_before_goal_sec:=45.0`, `min_local_map_known_ratio_before_goal:=0.70`, `min_goal_observations_before_acceptance:=5`, `goal_heuristic_rejection_radius_m:=0.38`, and `max_exploration_before_goal_sec:=105.0`. Once the final answer exists, `/mission_complete` stops the robots and the finalizer writes report evidence; the finalizer also watches `/final_start_to_goal_path` directly so the launch does not hang if that completion flag is missed.
 
 For map evidence:
 

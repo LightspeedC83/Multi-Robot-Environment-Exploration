@@ -53,6 +53,7 @@ LINEAR_VELOCITY = 0.5 # m/s
 ANGULAR_VELOCITY = 0.55 # rad/s
 
 SLAM_MAP_RESOLUTION_SCALAR = 10 # number of cells in the SLAM map per meter
+MAX_SLAM_MAP_SIDE_CELLS = 360 # keeps the demo map bounded so merger/reporting do not explode in memory
 
 # Implementation of Extra Credit
 PROBABILISTIC_MAPPING =  True # if this is true, instead of using binary updates, we Implement a recursive Bayesian update using log-odds to make the map resilient to sensor noise.
@@ -253,6 +254,7 @@ class WorldMapper(Node):
         self.SLAM_map_info = None # this holds information about the occupancy grid map we generate: .width and .height
         
         self.SLAM_map = None # initializing the slam map as all -1
+        self.map_expand_warning_time = 0.0
 
         self.max_sensor_range = None # max range for the laser sensor [m]
 
@@ -830,10 +832,20 @@ class WorldMapper(Node):
     def expand_SLAM_map(self, border_width:int):
         """Expands the SLAM_map by border_width cells, keeping the center in the center"""
         if self.SLAM_map is None: # if map hasn't been intiialized yet, do nothing
-            return
+            return False
         # getting new map size
         new_size_X = int(self.SLAM_MAP_SIZE_X + 2*border_width)
         new_size_Y = int(self.SLAM_MAP_SIZE_Y + 2*border_width)
+
+        if new_size_X > MAX_SLAM_MAP_SIDE_CELLS or new_size_Y > MAX_SLAM_MAP_SIDE_CELLS:
+            if time.monotonic() >= self.map_expand_warning_time:
+                #  map bound keeping: huge ray endpoints should not turn the report map into a gray ocean.
+                self.get_logger().warn(
+                    f"SLAM map expansion capped at {self.SLAM_MAP_SIZE_X}x{self.SLAM_MAP_SIZE_Y}; "
+                    f"ignoring ray outside demo arena bounds"
+                )
+                self.map_expand_warning_time = time.monotonic() + 3.0
+            return False
         
         # empty new map
         if self.PROBABILISTIC_MAPPING:
@@ -851,6 +863,8 @@ class WorldMapper(Node):
         self.SLAM_map = new_map
         self.SLAM_map_origin_X -= border_width * self.SLAM_map_res_m_per_cell
         self.SLAM_map_origin_Y -= border_width * self.SLAM_map_res_m_per_cell
+        self.SLAM_map_info = self.create_SLAM_map_info()
+        return True
 
     def create_SLAM_map_info(self):
         """this function creates a message header for the slam_map using the current time as timestamp"""
@@ -896,7 +910,8 @@ class WorldMapper(Node):
         if (ray_endpoint_grid_x < 0 or self.SLAM_MAP_SIZE_X <= ray_endpoint_grid_x or 
             ray_endpoint_grid_y < 0 or self.SLAM_MAP_SIZE_Y <= ray_endpoint_grid_y):
             # we will expand the map to be double it's current size (so border witdh is floor(map_side/2))
-            self.expand_SLAM_map(self.SLAM_MAP_SIZE_X//2) # TODO: uncomment later
+            #  expansion limiting: once the arena-sized map is enough, far endpoints get dropped.
+            self.expand_SLAM_map(max(20, self.SLAM_MAP_SIZE_X//4))
             return
 
         # if the endpoint is clear, then the all cells the ray passes through are marked as free space

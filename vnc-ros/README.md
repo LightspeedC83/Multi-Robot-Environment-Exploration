@@ -184,15 +184,14 @@ python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
 Generated files:
 
 ```text
-/root/ros2_ws/src/final_path_results/report_visuals/report_visual_results_pack.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_map_progression.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_merged_contribution_map.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_cv_detection_evidence.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_behavior_timeline.png
-/root/ros2_ws/src/final_path_results/report_visuals/report_visual_index.md
 ```
 
 ## Behavior Summary

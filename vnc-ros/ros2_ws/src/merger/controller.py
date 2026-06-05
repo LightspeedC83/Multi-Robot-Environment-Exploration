@@ -26,12 +26,12 @@ Responsibilities:
 # imports happen inside main().
 
 import math
+import time
 from typing import Dict, Tuple, Optional
 
 import numpy as np
 
 from merger import map_coordinator as mc
-
 
 # Constants
 
@@ -40,6 +40,9 @@ DEFAULT_CONFIDENCE_THRESH  = 0.5
 DEFAULT_MERGE_STATUS_TOPIC = '/merge_status'
 TRANSFORM_RETRY_CELLS      = 500   # try to realign after this many new known cells
 MIN_CELLS_BEFORE_FIRST_TRY = 1000  # don't bother before either robot has seen this much
+DEFAULT_USE_METADATA_ORIGIN_PRIOR = True
+MIN_CELLS_BEFORE_PRIOR_TRY = 300
+MIN_SECONDS_BETWEEN_FAST_PRIOR_TRIES = 1.0
 
 # Time in seconds between coordination passes when no per-robot trigger fires.
 COORDINATION_PERIOD_SEC = 5.0
@@ -145,6 +148,8 @@ def build_node():
 
             self.declare_parameter('confidence_threshold', DEFAULT_CONFIDENCE_THRESH)
             self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
+            self.declare_parameter('use_metadata_origin_prior', DEFAULT_USE_METADATA_ORIGIN_PRIOR)
+            self.use_metadata_origin_prior = bool(self.get_parameter('use_metadata_origin_prior').value)
             self.declare_parameter('map_topic_template', DEFAULT_MAP_TOPIC_TEMPLATE)
             self.map_topic_template = str(self.get_parameter('map_topic_template').value)
             self.declare_parameter('map_topic_alias_templates', DEFAULT_COMPAT_MAP_TOPIC_TEMPLATES)
@@ -156,6 +161,7 @@ def build_node():
             # the resolution it was solved at.
             self.known_transforms: Dict[Tuple[str, str], dict] = {}
             self._map_subs = {} # robot_id -> subscription object list
+            self._last_fast_prior_try_wall_time = 0.0
 
             qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
@@ -194,10 +200,12 @@ def build_node():
                 COORDINATION_PERIOD_SEC, self._coordination_pass,
             )
 
-            self.get_logger().info(f'map_coordinator ready, waiting for robots to register, 'f'confidence_threshold={self.confidence_threshold}')
+            self.get_logger().info(f'map_coordinator ready, waiting for robots to register, '
+                                   f'confidence_threshold={self.confidence_threshold}')
             self.get_logger().info(
                 f'standard map topic template={self.map_topic_template}; '
-                f'compatibility aliases={self.map_topic_alias_templates}'
+                f'compatibility aliases={self.map_topic_alias_templates}; '
+                f'metadata_origin_prior={self.use_metadata_origin_prior}'
             )
 
         def _read_topic_alias_templates(self):
@@ -272,10 +280,27 @@ def build_node():
                     state.latest_topic = source_topic
                     self.get_logger().info(f'{robot_id} map stream active on {source_topic}')
                 state.update_from_grid(grid, res, ox, oy)
-                if state.should_attempt_alignment():
+                if state.should_attempt_alignment() or self._should_fast_prior_align():
                     state.cells_known_at_last_alignment = state.cells_known
                     self._coordination_pass(triggering_robot=robot_id)
             return cb
+
+        def _should_fast_prior_align(self):
+            if not self.use_metadata_origin_prior:
+                return False
+            now = time.monotonic()
+            if now - self._last_fast_prior_try_wall_time < MIN_SECONDS_BETWEEN_FAST_PRIOR_TRIES:
+                return False
+            ready_states = [
+                state for state in self.robot_states.values()
+                if state.latest_grid is not None
+            ]
+            if len(ready_states) < 2:
+                return False
+            if any(state.cells_known < MIN_CELLS_BEFORE_PRIOR_TRY for state in ready_states):
+                return False
+            self._last_fast_prior_try_wall_time = now
+            return True
 
         # Coordination
 
@@ -318,27 +343,56 @@ def build_node():
                 )
                 return
 
+            prior_transforms = []
+            prior_labels = []
+            trusted_prior_labels = []
+            if self.use_metadata_origin_prior:
+                metadata_prior = self._metadata_origin_prior(anchor, follower)
+                if metadata_prior is not None:
+                    prior_transforms.append(metadata_prior)
+                    prior_labels.append('prior_metadata_origin')
+                    trusted_prior_labels.append('prior_metadata_origin')
+
             result = mc.merge_maps(
                 anchor.latest_grid, follower.latest_grid,
                 resolution_m_per_cell=anchor.resolution,
                 confidence_threshold=self.confidence_threshold,
+                prior_transforms=prior_transforms,
+                prior_labels=prior_labels,
+                trusted_prior_labels=trusted_prior_labels,
             )
 
             d = result['diagnostics']
             self.get_logger().info(
                 f'align {anchor_id}<-{follower_id}: '
+                f'source={d.get("candidate_source", "none")}, '
                 f'inliers={d.get("inliers", 0)}, '
                 f'wall_agree={d.get("wall_agreement", 0):.2f}, '
+                f'overlap={d.get("overlap_ratio", 0):.2f}, '
+                f'conflict={d.get("conflict_ratio", 0):.2f}, '
                 f'conf={result["confidence"]:.2f}, '
                 f'success={result["success"]}'
             )
 
             if not result['success']:
+                cached = self.known_transforms.get((anchor_id, follower_id))
+                if cached is not None:
+                    self.get_logger().info(
+                        f'using cached transform for {anchor_id}<-{follower_id}; '
+                        f'current alignment did not pass quality gates'
+                    )
+                    cached_result = self._cached_result(anchor, follower, cached)
+                    self._publish_merged_result(
+                        anchor_id, follower_id, cached_result,
+                        status_prefix='merged_map_published_cached',
+                    )
+                    return
                 self._publish_status(
                     f'alignment_failed anchor={anchor_id} follower={follower_id} '
                     f'confidence={result["confidence"]:.3f} '
                     f'inliers={d.get("inliers", 0)} '
-                    f'wall_agree={d.get("wall_agreement", 0):.3f}'
+                    f'wall_agree={d.get("wall_agreement", 0):.3f} '
+                    f'conflict={d.get("conflict_ratio", 0):.3f}'
                 )
                 return
 
@@ -347,7 +401,46 @@ def build_node():
                 'transform_pixels': result['transform_pixels'],
                 'transform_meters': result['transform_meters'],
                 'resolution': anchor.resolution,
+                'confidence': result['confidence'],
+                'candidate_source': d.get('candidate_source', 'unknown'),
             }
+
+            self._publish_merged_result(anchor_id, follower_id, result)
+
+        def _metadata_origin_prior(self, anchor, follower):
+            if anchor.origin_x is None or follower.origin_x is None:
+                return None
+            if anchor.resolution is None or anchor.resolution <= 0:
+                return None
+            dx_cells = (follower.origin_x - anchor.origin_x) / anchor.resolution
+            dy_cells = (follower.origin_y - anchor.origin_y) / anchor.resolution
+            return np.array(
+                [[1.0, 0.0, dx_cells],
+                 [0.0, 1.0, dy_cells]],
+                dtype=np.float32,
+            )
+
+        def _cached_result(self, anchor, follower, cached):
+            M = cached['transform_pixels']
+            return {
+                'success': True,
+                'confidence': cached.get('confidence', 0.0),
+                'transform_pixels': M,
+                'transform_meters': cached.get('transform_meters'),
+                'merged_grid': mc.fuse_grids(anchor.latest_grid, follower.latest_grid, M),
+                'diagnostics': {
+                    'candidate_source': f"cached_{cached.get('candidate_source', 'transform')}",
+                    'inliers': 0,
+                    'wall_agreement': 0.0,
+                    'overlap_ratio': 0.0,
+                    'conflict_ratio': 0.0,
+                },
+            }
+
+        def _publish_merged_result(self, anchor_id, follower_id, result,
+                                   status_prefix='merged_map_published'):
+            anchor = self.robot_states[anchor_id]
+            follower = self.robot_states[follower_id]
 
             # Broadcast TF: follower_odom -> anchor_odom (a.k.a. the "global"
             # frame from anchor's perspective). The planner can then chain
@@ -385,9 +478,11 @@ def build_node():
                 stamp=self.get_clock().now().to_msg(),
             )
             self._merged_pub.publish(msg)
+            d = result.get('diagnostics', {})
             self._publish_status(
-                f'merged_map_published anchor={anchor_id} follower={follower_id} '
+                f'{status_prefix} anchor={anchor_id} follower={follower_id} '
                 f'confidence={result["confidence"]:.3f} '
+                f'source={d.get("candidate_source", "unknown")} '
                 f'frame={anchor_id}/odom topic=/merged_map'
             )
 

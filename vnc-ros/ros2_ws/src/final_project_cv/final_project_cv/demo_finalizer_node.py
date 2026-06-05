@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finalize the integrated demo after the coordinator publishes mission complete."""
+"""Finalize the integrated demo after the coordinator publishes its answer."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import PoseArray
+from nav_msgs.msg import Path as NavPath
 from std_msgs.msg import Bool
 
 
@@ -38,26 +40,55 @@ class DemoFinalizer(Node):
         self.shutdown_delay_sec = float(self.get_parameter("shutdown_delay_sec").value)
         self.finalized = False
 
-        mission_qos = QoSProfile(
+        latched_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
-        self.subscription_holder = self.create_subscription(
-            Bool,
-            "/mission_complete",
-            self.mission_complete_callback,
-            mission_qos,
+        self.subscription_holder = [
+            self.create_subscription(
+                Bool,
+                "/mission_complete",
+                self.mission_complete_callback,
+                latched_qos,
+            ),
+            self.create_subscription(
+                PoseArray,
+                "/final_start_to_goal_path",
+                self.final_path_callback,
+                latched_qos,
+            ),
+            self.create_subscription(
+                NavPath,
+                "/final_start_to_goal_nav_path",
+                self.final_nav_path_callback,
+                latched_qos,
+            ),
+        ]
+        self.get_logger().info(
+            "demo finalizer ready; waiting for /mission_complete or final start-to-goal path"
         )
-        self.get_logger().info("demo finalizer ready; waiting for /mission_complete")
 
     def mission_complete_callback(self, msg: Bool) -> None:
-        if not msg.data or self.finalized:
+        if not msg.data:
             return
+        self.start_finalization_once("/mission_complete")
 
+    def final_path_callback(self, msg: PoseArray) -> None:
+        if msg.poses:
+            self.start_finalization_once("/final_start_to_goal_path")
+
+    def final_nav_path_callback(self, msg: NavPath) -> None:
+        if msg.poses:
+            self.start_finalization_once("/final_start_to_goal_nav_path")
+
+    def start_finalization_once(self, reason: str) -> None:
+        if self.finalized:
+            return
         self.finalized = True
+        self.get_logger().info(f"demo finalizer triggered by {reason}")
         worker = threading.Thread(target=self.finalize_demo, daemon=True)
         worker.start()
 

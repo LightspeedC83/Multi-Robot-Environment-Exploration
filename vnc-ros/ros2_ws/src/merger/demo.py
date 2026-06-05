@@ -22,7 +22,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
-import coordinator as mc
+import map_coordinator as mc
 
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
