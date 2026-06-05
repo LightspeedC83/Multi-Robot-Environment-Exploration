@@ -5,7 +5,7 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
-def detector_node(name, target, centroid_topic, debug_image_topic, use_sim_bottle_fallback):
+def detector_node(name, target, centroid_topic, debug_image_topic):
     return Node(
         package="final_project_cv",
         executable="vision_target_detector",
@@ -32,7 +32,6 @@ def detector_node(name, target, centroid_topic, debug_image_topic, use_sim_bottl
             "disable_nnpack": True,
             "fuse_yolo_model": False,
             "display_classes": "bottle,sports ball",
-            "use_sim_bottle_color_fallback": use_sim_bottle_fallback,
         }],
     )
 
@@ -138,7 +137,6 @@ def generate_launch_description():
             "bottle",
             "heuristic_centroid",
             "heuristic_debug_image",
-            True,
         ),
         localizer_node(
             "heuristic_bottle_localizer",
@@ -154,7 +152,6 @@ def generate_launch_description():
             "sports ball",
             "goal_centroid",
             "goal_debug_image",
-            True,
         ),
         localizer_node(
             "goal_sphere_localizer",

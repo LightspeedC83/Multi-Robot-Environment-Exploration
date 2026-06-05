@@ -12,6 +12,47 @@ Two robots explore an unknown Gazebo environment, build local occupancy-grid map
 - The coordinator publishes final RViz markers on `/final_result_markers` for the chosen start, detected goal, and final path.
 - The coordinator saves final path evidence under `/root/ros2_ws/src/final_path_results/`.
 - When the final answer is available, `/mission_complete` stops robot motion.
+- The integrated demo uses YOLO for bottle and sports-ball detections, then lazy-loads FastSAM to refine the centroid with a learned segmentation mask when a target is selected.
+
+## Architecture
+
+The demo is a ROS 2 system with four main layers:
+
+```text
+Gazebo world
+  -> robot sensors: camera, LiDAR, odom
+  -> final_project_cv: goal and heuristic detection/localization
+  -> mapper: per-robot occupancy mapping, frontier motion, obstacle recovery
+  -> coordinator: ID assignment, path service, goal gate, final A* answer
+  -> merger: map alignment and /merged_map publication
+  -> demo_finalizer: snapshots, report visuals, and clean shutdown
+```
+
+The intended behavior is:
+
+```text
+1. Robots start at arbitrary poses and do not rely on a known relationship.
+2. Each mapper builds an occupancy belief grid from LiDAR and requests frontier paths.
+3. CV publishes bottle heuristic points and sports-ball goal points in each robot odom frame.
+4. Before the goal is accepted, bottle points bias frontier ranking but are never treated as destinations.
+5. Goal observations are held until maps are mature, repeated observations cluster, and cap-like false positives are rejected.
+6. The merger publishes /merged_map in the anchor frame, normally robot1/odom.
+7. The coordinator computes A* from each robot start to the stored goal and publishes the shortest path.
+8. /mission_complete stops robot motion and the finalizer writes report evidence.
+```
+
+For tomorrow, the fastest code-reading path is:
+
+```text
+vnc-ros/ros2_ws/src/final_project_cv/launch/integrated_two_robot_demo.launch.py
+vnc-ros/ros2_ws/src/final_project_cv/worlds/lightweight_targets.world
+vnc-ros/ros2_ws/src/final_project_cv/final_project_cv/vision_target_detector_node.py
+vnc-ros/ros2_ws/src/final_project_cv/final_project_cv/target_localizer_node.py
+vnc-ros/ros2_ws/src/mapper/mapper.py
+vnc-ros/ros2_ws/src/mapper/coordinator.py
+vnc-ros/ros2_ws/src/merger/merger/map_coordinator.py
+vnc-ros/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py
+```
 
 ## Architecture
 

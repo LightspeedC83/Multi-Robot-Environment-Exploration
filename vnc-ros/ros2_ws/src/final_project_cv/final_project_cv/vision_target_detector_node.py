@@ -287,8 +287,6 @@ class VisionTargetDetector(Node):
         self.declare_parameter("publish_debug_image", True)
         self.declare_parameter("draw_all_detections", True)
         self.declare_parameter("display_classes", "bottle,sports ball")
-        self.declare_parameter("use_sim_bottle_color_fallback", True)
-        self.declare_parameter("sim_bottle_min_area", 25.0)
         self.declare_parameter("yolo_conf", 0.25)
         self.declare_parameter("fastsam_conf", 0.4)
         self.declare_parameter("fastsam_iou", 0.9)
@@ -314,10 +312,6 @@ class VisionTargetDetector(Node):
         self.publish_debug_image = parameter_as_bool(self.get_parameter("publish_debug_image").value)
         self.draw_all_detections = parameter_as_bool(self.get_parameter("draw_all_detections").value)
         self.display_classes = parse_class_list(self.get_parameter("display_classes").value)
-        self.use_sim_bottle_color_fallback = parameter_as_bool(
-            self.get_parameter("use_sim_bottle_color_fallback").value
-        )
-        self.sim_bottle_min_area = float(self.get_parameter("sim_bottle_min_area").value)
         self.yolo_conf = float(self.get_parameter("yolo_conf").value)
         self.fastsam_conf = float(self.get_parameter("fastsam_conf").value)
         self.fastsam_iou = float(self.get_parameter("fastsam_iou").value)
@@ -342,7 +336,8 @@ class VisionTargetDetector(Node):
         self.configure_torch_threads()
         self.detector = load_yolo_model(self.yolo_weights) if self.use_yolo else None
         self.fuse_detector_if_requested()
-        self.segmenter = load_fastsam_model(self.fastsam_weights) if self.use_fastsam else None
+        self.segmenter = None
+        self.fastsam_load_failed = False
         self.frame_count = 0
         self.tracked_bbox = None
         self.tracked_centroid = None
@@ -387,6 +382,23 @@ class VisionTargetDetector(Node):
         except Exception as exc:
             self.get_logger().debug(f"Could not fuse YOLO model: {exc}")
 
+    def fastsam_model(self):
+        if not self.use_fastsam:
+            return None
+        if self.segmenter is not None:
+            return self.segmenter
+        if self.fastsam_load_failed:
+            return None
+
+        try:
+            # lazy loading: RViz gets debug images right away, then masks arrive when a target exists.
+            self.segmenter = load_fastsam_model(self.fastsam_weights)
+            self.get_logger().info(f"FastSAM mask refinement loaded from '{self.fastsam_weights}'")
+        except Exception as exc:
+            self.fastsam_load_failed = True
+            self.get_logger().warn(f"FastSAM could not be loaded; using YOLO bbox measurements: {exc}")
+        return self.segmenter
+
     def image_callback(self, msg):
         self.frame_count += 1
         if self.frame_count % self.process_every_n != 0:
@@ -404,8 +416,6 @@ class VisionTargetDetector(Node):
                 verbose=False,
             )
             all_detections.extend(self.get_all_detections(yolo_results[0]))
-        if self.use_sim_bottle_color_fallback:
-            all_detections.extend(self.detect_sim_color_targets(processed_frame))
 
         visible_detections = [
             detection for detection in all_detections
@@ -498,7 +508,7 @@ class VisionTargetDetector(Node):
         return " | ".join(messages)
 
     def reject_bottle_cap_goal_candidates(self, detections, frame_shape=None):
-        """Remove orange bottle caps from synthetic sports-ball candidates."""
+        """Remove cap-like YOLO sports-ball candidates near bottle detections."""
         bottles = [detection for detection in detections if detection["class_name"] == "bottle"]
 
         filtered = []
@@ -580,77 +590,6 @@ class VisionTargetDetector(Node):
 
         return detections
 
-    def detect_sim_color_targets(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # The lightweight Gazebo bottles are deliberately cyan/blue. This
-        # fallback is only for the synthetic world where pretrained YOLO does
-        # not see simple cylinder models as real bottles. The goal ball is
-        # deliberately orange for the same reason.
-        lower_blue = np.array([82, 45, 35], dtype=np.uint8)
-        upper_blue = np.array([112, 255, 235], dtype=np.uint8)
-        lower_orange = np.array([4, 70, 70], dtype=np.uint8)
-        upper_orange = np.array([25, 255, 255], dtype=np.uint8)
-
-        detections = []
-        detections.extend(self.detect_sim_color_components(
-            hsv,
-            lower_blue,
-            upper_blue,
-            class_name="bottle",
-            min_area=self.sim_bottle_min_area,
-            require_tall=True,
-            confidence=0.95,
-        ))
-        detections.extend(self.detect_sim_color_components(
-            hsv,
-            lower_orange,
-            upper_orange,
-            class_name="sports ball",
-            min_area=12.0,
-            require_tall=False,
-            confidence=0.92,
-        ))
-        return detections
-
-    def detect_sim_color_components(self, hsv, lower, upper, class_name, min_area, require_tall, confidence):
-        mask = cv2.inRange(hsv, lower, upper)
-
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detections = []
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < min_area:
-                continue
-
-            x, y, w, h = cv2.boundingRect(contour)
-            if h < 3 or w < 3:
-                continue
-            if require_tall and (h < 10 or h < 1.35 * w):
-                continue
-
-            component_mask = np.zeros(mask.shape, dtype=np.uint8)
-            cv2.drawContours(component_mask, [contour], -1, 255, thickness=cv2.FILLED)
-            bbox = detection_bbox_from_mask(component_mask)
-            if bbox is None:
-                continue
-
-            detections.append({
-                "bbox": bbox,
-                "confidence": confidence,
-                "class_id": -1,
-                "class_name": class_name,
-                "source": "sim_color",
-                "mask": component_mask.astype(np.float32) / 255.0,
-            })
-
-        return detections
-
     def select_detection(self, detections, frame_shape):
         if not detections:
             return None
@@ -699,8 +638,9 @@ class VisionTargetDetector(Node):
 
         fallback = (bbox_center(bbox), bbox_diameter(bbox), None, "bbox")
 
-        if self.use_fastsam:
-            sam_results = self.segmenter(
+        segmenter = self.fastsam_model()
+        if segmenter is not None:
+            sam_results = segmenter(
                 frame,
                 bboxes=[bbox],
                 imgsz=self.imgsz,

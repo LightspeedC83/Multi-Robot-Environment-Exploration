@@ -180,6 +180,8 @@ def cv_pipeline(robot_namespace, pipeline_launch):
             "lidar_frame": f"{robot_namespace}/base_scan",
             "use_yolo": LaunchConfiguration("use_yolo"),
             "use_fastsam": LaunchConfiguration("use_fastsam"),
+            "process_width": LaunchConfiguration("process_width"),
+            "imgsz": LaunchConfiguration("imgsz"),
             "process_every_n": LaunchConfiguration("process_every_n"),
         }.items(),
     )
@@ -221,18 +223,28 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "use_yolo",
-            default_value="false",
-            description="Use YOLO weights instead of synthetic-color fallback detection.",
+            default_value="true",
+            description="Use YOLO weights for target detection.",
         ),
         DeclareLaunchArgument(
             "use_fastsam",
-            default_value="false",
-            description="Enable FastSAM mask refinement for CV target detection.",
+            default_value="true",
+            description="Use FastSAM mask refinement after YOLO target detection.",
         ),
         DeclareLaunchArgument(
             "process_every_n",
             default_value="2",
             description="Run CV on every nth camera frame.",
+        ),
+        DeclareLaunchArgument(
+            "process_width",
+            default_value="320",
+            description="Resize camera frames to this width before YOLO/FastSAM inference.",
+        ),
+        DeclareLaunchArgument(
+            "imgsz",
+            default_value="320",
+            description="YOLO/FastSAM inference size for the integrated demo.",
         ),
         DeclareLaunchArgument(
             "fresh_start",

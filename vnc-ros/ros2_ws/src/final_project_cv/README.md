@@ -22,7 +22,7 @@ camera image
 
 The localizer prefers the LiDAR beam at the camera-centroid bearing when that range is consistent with the visual size estimate. If the beam is likely an obstacle or self-hit, it falls back to the visual estimate and logs the rejected LiDAR range.
 
-For the synthetic Gazebo world, the goal detector also rejects orange bottle caps, clipped image-edge blobs, and strongly non-round orange components before publishing a sports-ball point. This keeps heuristic bottles from becoming false final goals.
+The integrated demo uses YOLO for both detector classes (`sports ball` and `bottle`), then FastSAM lazy-loads and refines the measurement with a learned mask when a target is selected. False final goals are handled downstream by stable goal clustering and rejection of goal clusters that sit on top of heuristic bottle clues.
 
 Example log:
 
@@ -99,7 +99,7 @@ ros2 launch final_project_cv dual_target_tracking_pipeline.launch.py robot_names
 Lower-load integrated run:
 
 ```bash
-ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=3 use_fastsam:=false
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=4 process_width:=320 imgsz:=320
 ```
 
 ## Visualization
