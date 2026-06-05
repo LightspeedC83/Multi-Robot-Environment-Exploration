@@ -27,7 +27,7 @@ def detector_node(name, target, centroid_topic, debug_image_topic, use_sim_bottl
             "process_width": ParameterValue(LaunchConfiguration("process_width"), value_type=int),
             "process_every_n": ParameterValue(LaunchConfiguration("process_every_n"), value_type=int),
             "imgsz": ParameterValue(LaunchConfiguration("imgsz"), value_type=int),
-            "selection_strategy": "largest",
+            "selection_strategy": "bottom" if target == "sports ball" else "largest",
             "smooth_alpha": ParameterValue(LaunchConfiguration("smooth_alpha"), value_type=float),
             "disable_nnpack": True,
             "fuse_yolo_model": False,
@@ -37,7 +37,7 @@ def detector_node(name, target, centroid_topic, debug_image_topic, use_sim_bottl
     )
 
 
-def localizer_node(name, target, object_diameter_m, centroid_topic, point_topic, pose_topic):
+def localizer_node(name, target, object_diameter_m, centroid_topic, point_topic, pose_topic, prefer_lidar_range):
     return Node(
         package="final_project_cv",
         executable="target_localizer",
@@ -55,6 +55,7 @@ def localizer_node(name, target, object_diameter_m, centroid_topic, point_topic,
             "camera_frame": LaunchConfiguration("camera_frame"),
             "lidar_frame": LaunchConfiguration("lidar_frame"),
             "object_diameter_m": ParameterValue(object_diameter_m, value_type=float),
+            "prefer_lidar_range": prefer_lidar_range,
             "lidar_window_deg": ParameterValue(LaunchConfiguration("lidar_window_deg"), value_type=float),
             "min_lidar_target_range_m": ParameterValue(LaunchConfiguration("min_lidar_target_range_m"), value_type=float),
             "lidar_vision_tolerance_m": ParameterValue(LaunchConfiguration("lidar_vision_tolerance_m"), value_type=float),
@@ -146,6 +147,7 @@ def generate_launch_description():
             "heuristic_centroid",
             "heuristic_point_odom",
             "heuristic_pose_odom",
+            True,
         ),
         detector_node(
             "goal_sphere_detector",
@@ -161,5 +163,6 @@ def generate_launch_description():
             "goal_centroid",
             "goal_point_odom",
             "goal_pose_odom",
+            False,
         ),
     ])
