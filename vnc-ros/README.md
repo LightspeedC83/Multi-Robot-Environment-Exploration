@@ -80,6 +80,8 @@ The launch starts Gazebo, both robot mappers/controllers, the coordinator, map m
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
 ```
 
+The final demo uses YOLO detections (`use_yolo:=true`) for both the bottle heuristic and the sports-ball goal, then FastSAM refines the centroid with a learned segmentation mask (`use_fastsam:=true`). The integrated launch defaults to 320 px inference so the live RViz panels update reliably on CPU Docker. It does not use a color-threshold detector.
+
 The default run uses `min_exploration_before_goal_sec:=45.0`, so a goal seen immediately by the camera is held briefly while both robots begin frontier exploration. This is a minimum exploration window; after it passes, the demo still waits until the final A* answer exists, captures a few seconds of evidence, prints `RESULTS READY`, and exits. Lower it for a faster final answer:
 
 ```bash
@@ -95,7 +97,7 @@ ros2 launch final_project_cv integrated_two_robot_demo.launch.py auto_finalize:=
 Lower-load detection option:
 
 ```bash
-ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=3 use_fastsam:=false
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py process_every_n:=4 process_width:=320 imgsz:=320
 ```
 
 ## Visual Evidence
@@ -184,15 +186,14 @@ python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
 Generated files:
 
 ```text
-/root/ros2_ws/src/final_path_results/report_visuals/report_visual_results_pack.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_map_progression.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_merged_contribution_map.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_cv_detection_evidence.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_behavior_timeline.png
-/root/ros2_ws/src/final_path_results/report_visuals/report_visual_index.md
 ```
 
 ## Behavior Summary

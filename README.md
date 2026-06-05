@@ -6,11 +6,53 @@ Two robots explore an unknown Gazebo environment, build local occupancy-grid map
 
 - Each robot runs local mapping, obstacle avoidance, and frontier exploration.
 - Bottle detections are heuristic clues only before the goal is seen.
-- Once either robot sees the goal sphere, heuristic clues are ignored and exploration motion freezes while the final A* answer is published.
+- If either robot sees the goal sphere early, the coordinator remembers that observation while frontier exploration continues until both local maps are readable enough for report evidence and the goal point is stable across repeated observations away from bottle-clue false positives.
+- Once the local-map evidence gate passes, heuristic clues are ignored and the final A* answer is published.
 - The coordinator publishes the final shortest A* start-to-goal path on `/final_start_to_goal_path` and `/final_start_to_goal_nav_path`.
 - The coordinator publishes final RViz markers on `/final_result_markers` for the chosen start, detected goal, and final path.
 - The coordinator saves final path evidence under `/root/ros2_ws/src/final_path_results/`.
 - When the final answer is available, `/mission_complete` stops robot motion.
+- The integrated demo uses YOLO for bottle and sports-ball detections, then lazy-loads FastSAM to refine the centroid with a learned segmentation mask when a target is selected.
+
+## Architecture
+
+The demo is a ROS 2 system with four main layers:
+
+```text
+Gazebo world
+  -> robot sensors: camera, LiDAR, odom
+  -> final_project_cv: goal and heuristic detection/localization
+  -> mapper: per-robot occupancy mapping, frontier motion, obstacle recovery
+  -> coordinator: ID assignment, path service, goal gate, final A* answer
+  -> merger: map alignment and /merged_map publication
+  -> demo_finalizer: snapshots, report visuals, and clean shutdown
+```
+
+The intended behavior is:
+
+```text
+1. Robots start at arbitrary poses and do not rely on a known relationship.
+2. Each mapper builds an occupancy belief grid from LiDAR and requests frontier paths.
+3. CV publishes bottle heuristic points and sports-ball goal points in each robot odom frame.
+4. Before the goal is accepted, bottle points bias frontier ranking but are never treated as destinations.
+5. Goal observations are held until maps are mature, repeated observations cluster, and cap-like false positives are rejected.
+6. The merger publishes /merged_map in the anchor frame, normally robot1/odom.
+7. The coordinator computes A* from each robot start to the stored goal and publishes the shortest path.
+8. /mission_complete stops robot motion and the finalizer writes report evidence.
+```
+
+For tomorrow, the fastest code-reading path is:
+
+```text
+vnc-ros/ros2_ws/src/final_project_cv/launch/integrated_two_robot_demo.launch.py
+vnc-ros/ros2_ws/src/final_project_cv/worlds/lightweight_targets.world
+vnc-ros/ros2_ws/src/final_project_cv/final_project_cv/vision_target_detector_node.py
+vnc-ros/ros2_ws/src/final_project_cv/final_project_cv/target_localizer_node.py
+vnc-ros/ros2_ws/src/mapper/mapper.py
+vnc-ros/ros2_ws/src/mapper/coordinator.py
+vnc-ros/ros2_ws/src/merger/merger/map_coordinator.py
+vnc-ros/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py
+```
 
 ## Topic Convention
 
@@ -68,13 +110,13 @@ The launch defaults to `fresh_start:=true`, so stale Gazebo and ROS demo process
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
 ```
 
-The launch also holds very early goal detections for `min_exploration_before_goal_sec:=45.0` seconds. This is a minimum exploration window, not an exact program-end timestamp: once the gate has passed and a final A* path exists, `/mission_complete` stops the robots, the finalizer captures a few seconds of map/CV evidence, prints `RESULTS READY`, and exits.
+The launch also holds very early goal detections while local maps mature. By default, the goal cannot finish the demo until `min_exploration_before_goal_sec:=45.0` has passed, each robot has at least `min_local_map_known_ratio_before_goal:=0.70` known coverage inside the arena region, at least `min_goal_observations_before_acceptance:=5` clustered goal observations agree, and the accepted goal cluster is not sitting directly on a heuristic bottle clue (`goal_heuristic_rejection_radius_m:=0.38`). `max_exploration_before_goal_sec:=105.0` is a safety cap so the terminal does not run forever if one robot gets imperfect coverage. Once the gate passes and a final A* path exists, `/mission_complete` stops the robots, the finalizer captures a few seconds of map/CV evidence, prints `RESULTS READY`, and exits.
 
 ```bash
-ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0 min_local_map_known_ratio_before_goal:=0.35 min_goal_observations_before_acceptance:=2
 ```
 
-After `/mission_complete`, the default launch captures final map/CV snapshots, generates the report visual pack, prints `RESULTS READY`, and shuts the demo down. For a manual RViz session that keeps running:
+After `/mission_complete`, the default launch captures final map/CV snapshots, saves raw map grids for reproducible figures, generates report visuals, prints `RESULTS READY`, and shuts the demo down. For a manual RViz session that keeps running:
 
 ```bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py auto_finalize:=false
@@ -140,7 +182,16 @@ Final report artifacts:
 /root/ros2_ws/src/final_path_results/final_start_to_goal_summary.txt
 ```
 
-While the demo is running, optionally capture live CV and map snapshots for the report pack:
+The snapshot folder also keeps first-goal CV evidence and raw map grids:
+
+```text
+/root/ros2_ws/src/final_path_results/snapshots/first_goal_robot*_camera_raw.png
+/root/ros2_ws/src/final_path_results/snapshots/first_goal_robot*_goal_debug.png
+/root/ros2_ws/src/final_path_results/snapshots/map_robot*_slam.npz
+/root/ros2_ws/src/final_path_results/snapshots/map_merged.npz
+```
+
+While the demo is running, optionally capture live CV and map snapshots for the report figures:
 
 ```bash
 python3 /root/ros2_ws/src/final_project_cv/tools/capture_report_snapshots.py \
@@ -158,15 +209,14 @@ python3 /root/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py \
 This creates:
 
 ```text
-/root/ros2_ws/src/final_path_results/report_visuals/report_visual_results_pack.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_demo_evidence_panel.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_map_progression.png
+/root/ros2_ws/src/final_path_results/report_visuals/report_merged_contribution_map.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_cv_detection_evidence.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_waypoint_trace.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_system_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_topic_flow.png
 /root/ros2_ws/src/final_path_results/report_visuals/report_behavior_timeline.png
-/root/ros2_ws/src/final_path_results/report_visuals/report_visual_index.md
 ```
 
 ## Packages

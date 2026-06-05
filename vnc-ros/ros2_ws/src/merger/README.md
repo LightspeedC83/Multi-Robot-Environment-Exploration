@@ -38,8 +38,9 @@ The node creates map subscriptions after receiving robot IDs. `/new_robot_id` us
 ## Parameters
 
 ```text
-confidence_threshold   default: 0.5
-map_topic_template     default: /SLAM_map_{id}
+confidence_threshold      default in integrated launch: 0.68
+use_metadata_origin_prior default: true
+map_topic_template        default: /SLAM_map_{id}
 map_topic_alias_templates default: [/{robot_id}/SLAM_map]
 ```
 
@@ -51,7 +52,11 @@ ros2 run merger map_merger_node --ros-args -p confidence_threshold:=0.7
 
 ## Notes
 
-- Alignment is attempted periodically and after maps gain enough new known cells.
-- If confidence is too low, the node keeps publishing local maps separately and waits for more structure.
+- Alignment is attempted as soon as both maps have enough known cells, then periodically as the maps grow.
+- The integrated Gazebo demo uses OccupancyGrid origin metadata as a trusted prior. This keeps the merge stable when both odom frames are already world-aligned and prevents ORB from rotating a partial map into a false match.
+- Feature-based ORB/RANSAC alignment is still scored, but it must pass wall agreement, overlap, and occupancy-conflict gates before publication.
+- Once a transform is accepted, the node reuses it to keep publishing a fuller `/merged_map` even when a later feature retry is inconclusive.
+- If confidence is too low and no cached transform exists, the node keeps publishing local maps separately and waits for more structure.
 - `/merge_status` reports whether the node is waiting for maps, rejected an alignment, or published a merged map.
 - In RViz, `/merged_map` appears once a successful alignment has been accepted.
+- For report evidence, `report_merged_contribution_map.png` redraws the saved local map grids with robot 1 cells, robot 2 cells, overlap, occupied cells, and the final A* path in separate colors.
