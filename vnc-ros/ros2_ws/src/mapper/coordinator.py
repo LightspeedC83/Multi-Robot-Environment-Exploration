@@ -83,7 +83,17 @@ FRONTIER_RAYCAST_ANGULAR_RESOLUTION = 10 # degrees between rays in raycast simul
 FREQUENCY = 5 #Hz.
 
 USE_SIM_TIME = True
-STARTUP_TIMEOUT = 15.0 # s. Max wait for simulator/controller startup.
+STARTUP_TIMEOUT = 1.0 # s. Max wait for simulator/controller startup.
+DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC = 45.0 # demo breathing before an early camera hit freezes motion.
+DEFAULT_MAX_EXPLORATION_BEFORE_GOAL_SEC = 105.0 # cap so map-evidence waiting cannot run forever.
+DEFAULT_MIN_LOCAL_MAP_KNOWN_RATIO_BEFORE_GOAL = 0.70 # each local map should make the arena readable.
+DEFAULT_MIN_LOCAL_MAP_KNOWN_CELLS_BEFORE_GOAL = 1000 # absolute floor for low-resolution/demo map variants.
+DEFAULT_GOAL_MAP_COMPLETION_ROI_HALF_WIDTH_M = 2.45
+DEFAULT_GOAL_MAP_COMPLETION_ROI_HALF_HEIGHT_M = 2.45
+DEFAULT_MIN_GOAL_OBSERVATIONS_BEFORE_ACCEPTANCE = 5
+DEFAULT_GOAL_OBSERVATION_CLUSTER_RADIUS_M = 0.60
+DEFAULT_GOAL_OBSERVATION_WINDOW_SEC = 24.0
+DEFAULT_GOAL_HEURISTIC_REJECTION_RADIUS_M = 0.38 # cap-sized false goals sit almost on the bottle clue.
 
 
 class Coordinator(Node):
@@ -100,6 +110,62 @@ class Coordinator(Node):
             USE_SIM_TIME
         )
         self.set_parameters([use_sim_time_param])
+
+        self.declare_parameter("min_exploration_before_goal_sec", DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC)
+        self.declare_parameter("max_exploration_before_goal_sec", DEFAULT_MAX_EXPLORATION_BEFORE_GOAL_SEC)
+        self.declare_parameter("min_local_map_known_ratio_before_goal", DEFAULT_MIN_LOCAL_MAP_KNOWN_RATIO_BEFORE_GOAL)
+        self.declare_parameter("min_local_map_known_cells_before_goal", DEFAULT_MIN_LOCAL_MAP_KNOWN_CELLS_BEFORE_GOAL)
+        self.declare_parameter("goal_map_completion_roi_half_width_m", DEFAULT_GOAL_MAP_COMPLETION_ROI_HALF_WIDTH_M)
+        self.declare_parameter("goal_map_completion_roi_half_height_m", DEFAULT_GOAL_MAP_COMPLETION_ROI_HALF_HEIGHT_M)
+        self.declare_parameter("min_goal_observations_before_acceptance", DEFAULT_MIN_GOAL_OBSERVATIONS_BEFORE_ACCEPTANCE)
+        self.declare_parameter("goal_observation_cluster_radius_m", DEFAULT_GOAL_OBSERVATION_CLUSTER_RADIUS_M)
+        self.declare_parameter("goal_observation_window_sec", DEFAULT_GOAL_OBSERVATION_WINDOW_SEC)
+        self.declare_parameter("goal_heuristic_rejection_radius_m", DEFAULT_GOAL_HEURISTIC_REJECTION_RADIUS_M)
+        self.min_exploration_before_goal_sec = max(
+            0.0,
+            float(self.get_parameter("min_exploration_before_goal_sec").value),
+        )
+        self.max_exploration_before_goal_sec = max(
+            self.min_exploration_before_goal_sec,
+            float(self.get_parameter("max_exploration_before_goal_sec").value),
+        )
+        self.min_local_map_known_ratio_before_goal = max(
+            0.0,
+            min(1.0, float(self.get_parameter("min_local_map_known_ratio_before_goal").value)),
+        )
+        self.min_local_map_known_cells_before_goal = max(
+            0,
+            int(self.get_parameter("min_local_map_known_cells_before_goal").value),
+        )
+        self.goal_map_completion_roi_half_width_m = max(
+            0.0,
+            float(self.get_parameter("goal_map_completion_roi_half_width_m").value),
+        )
+        self.goal_map_completion_roi_half_height_m = max(
+            0.0,
+            float(self.get_parameter("goal_map_completion_roi_half_height_m").value),
+        )
+        self.min_goal_observations_before_acceptance = max(
+            1,
+            int(self.get_parameter("min_goal_observations_before_acceptance").value),
+        )
+        self.goal_observation_cluster_radius_m = max(
+            0.05,
+            float(self.get_parameter("goal_observation_cluster_radius_m").value),
+        )
+        self.goal_observation_window_sec = max(
+            1.0,
+            float(self.get_parameter("goal_observation_window_sec").value),
+        )
+        self.goal_heuristic_rejection_radius_m = max(
+            0.0,
+            float(self.get_parameter("goal_heuristic_rejection_radius_m").value),
+        )
+        self.goal_gate_start_wall_time = time.monotonic()
+        self.pending_goal_target_msgs = {} # robot_id --> goal observations held while maps get some motion
+        self.pending_shared_goal_target_msg = None
+        self.next_goal_gate_log_wall_time = 0.0
+        self.goal_observation_history = {} # robot_id --> recent goal points waiting for stable clustering
 
 
         ## top level parameters ##
@@ -164,7 +230,7 @@ class Coordinator(Node):
         self.final_marker_publisher = self.create_publisher(MarkerArray, "/final_result_markers", latched_qos)
         self.legacy_final_path_publisher = self.create_publisher(PoseArray, "/final_goal_to_start_path", latched_qos)
         self.legacy_final_nav_path_publisher = self.create_publisher(NavPath, "/final_goal_to_start_nav_path", latched_qos)
-        self.mission_complete_publisher = self.create_publisher(Bool, "/mission_complete", 1)
+        self.mission_complete_publisher = self.create_publisher(Bool, "/mission_complete", latched_qos)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -211,6 +277,8 @@ class Coordinator(Node):
             response.message = "Requester has no id"
             self.get_logger().warn(f"received path request from robot with no ID {requester_id}")
             return response
+
+        self.accept_pending_goal_if_ready()
 
         if self.goal_target_msgs:
             self.update_and_publish_final_goal_path(force=True)
@@ -339,21 +407,327 @@ class Coordinator(Node):
     def _target_callback(self, msg:PointStamped, robot_id:int, target_kind:str):
         """Store target observations so planner requests can use the latest CV hint."""
         if target_kind == "goal":
-            self.goal_target_msgs[robot_id] = msg
-            self.shared_goal_target_msg = msg
-            self.goal_first_seen_wall_times.setdefault(robot_id, time.monotonic())
-            if robot_id not in self.goal_seen_logged:
-                #  goal noticing: one log is enough, the camera publishes this fast.
-                self.get_logger().info(
-                    f"goal observation from robot_{robot_id}: "
-                    f"({msg.point.x:.2f}, {msg.point.y:.2f})"
-                )
-                self.goal_seen_logged.add(robot_id)
-            #  goal locking: once the real sphere exists, stop search motion and compute the answer.
+            self.remember_goal_observation(msg, robot_id)
+            goal_gate_open, hold_reason, coverage_summary = self.goal_acceptance_gate_status()
+            stable_robot_id, stable_goal_msg, stable_count = self.select_stable_goal_observation()
+            if not goal_gate_open or stable_goal_msg is None:
+                self.pending_goal_target_msgs[robot_id] = msg
+                self.pending_shared_goal_target_msg = msg
+                wall_now = time.monotonic()
+                if wall_now >= self.next_goal_gate_log_wall_time:
+                    elapsed = wall_now - self.goal_gate_start_wall_time
+                    remaining = max(0.0, self.min_exploration_before_goal_sec - elapsed)
+                    reason = hold_reason if not goal_gate_open else "stable goal evidence"
+                    #  exploration first: seeing the ball early should not freeze half-built local maps.
+                    self.get_logger().info(
+                        "holding goal observation while frontier exploration improves local maps "
+                        f"(reason={reason}, remaining_time={remaining:.1f}s, "
+                        f"coverage={coverage_summary}, "
+                        f"stable_goal_cluster={stable_count}/{self.min_goal_observations_before_acceptance}, "
+                        f"robot_{robot_id}=({msg.point.x:.2f}, {msg.point.y:.2f}))"
+                    )
+                    self.next_goal_gate_log_wall_time = wall_now + 2.0
+                return
+
+            self.store_goal_observation(stable_goal_msg, stable_robot_id)
+            #  goal locking: once the real sphere is accepted, stop search motion and compute the answer.
             self.publish_stop_commands()
         else:
             self.heuristic_target_msgs[robot_id] = msg
         self.update_and_publish_final_goal_path()
+
+    def goal_acceptance_gate_open(self):
+        """Return true once the demo has enough time and map evidence."""
+        return self.goal_acceptance_gate_status()[0]
+
+    def goal_acceptance_gate_status(self):
+        """Explain whether the held visual goal is allowed to finish the demo."""
+        elapsed = time.monotonic() - self.goal_gate_start_wall_time
+        time_ready = elapsed >= self.min_exploration_before_goal_sec
+        coverage_ready, coverage_summary = self.local_maps_ready_for_final_answer(elapsed)
+        gate_open = time_ready and coverage_ready
+
+        if gate_open:
+            reason = "ready"
+        elif not time_ready:
+            reason = "minimum exploration time"
+        else:
+            reason = "local map coverage"
+        return gate_open, reason, coverage_summary
+
+    def robot_ids_expected_for_mapping(self):
+        """Return robot IDs that should have readable local maps before finalizing."""
+        if self.global_id > 0:
+            return list(range(1, self.global_id + 1))
+        return sorted(self.map_msgs.keys())
+
+    def local_map_coverage_metrics(self, robot_id):
+        """Measure how much of the demo arena this robot has made non-unknown."""
+        map_msg = self.map_msgs.get(robot_id)
+        if map_msg is None:
+            return {
+                "available": False,
+                "known_ratio": 0.0,
+                "known_cells": 0,
+                "total_cells": 0,
+            }
+
+        grid, resolution, origin_x, origin_y, origin_theta, width, height, _ = self.unpack_map_msg(map_msg)
+        half_width = self.goal_map_completion_roi_half_width_m
+        half_height = self.goal_map_completion_roi_half_height_m
+
+        if half_width <= 0.0 or half_height <= 0.0:
+            roi_mask = np.ones((height, width), dtype=bool)
+        else:
+            cols = np.arange(width, dtype=np.float32)
+            rows = np.arange(height, dtype=np.float32)
+            cell_x, cell_y = np.meshgrid((cols + 0.5) * resolution, (rows + 0.5) * resolution)
+            cos_t = math.cos(origin_theta)
+            sin_t = math.sin(origin_theta)
+            world_x = cos_t * cell_x - sin_t * cell_y + origin_x
+            world_y = sin_t * cell_x + cos_t * cell_y + origin_y
+            roi_mask = (
+                (world_x >= -half_width)
+                & (world_x <= half_width)
+                & (world_y >= -half_height)
+                & (world_y <= half_height)
+            )
+            if not np.any(roi_mask):
+                roi_mask = np.ones((height, width), dtype=bool)
+
+        known_mask = grid != -1
+        total_cells = int(np.count_nonzero(roi_mask))
+        known_cells = int(np.count_nonzero(known_mask & roi_mask))
+        known_ratio = known_cells / total_cells if total_cells > 0 else 0.0
+        return {
+            "available": True,
+            "known_ratio": known_ratio,
+            "known_cells": known_cells,
+            "total_cells": total_cells,
+        }
+
+    def local_maps_ready_for_final_answer(self, elapsed):
+        """Keep frontier exploration alive until local maps are report-readable."""
+        expected_robot_ids = self.robot_ids_expected_for_mapping()
+        if len(expected_robot_ids) == 0:
+            return False, "no registered robots yet"
+
+        pieces = []
+        all_ready = True
+        any_map = False
+        for robot_id in expected_robot_ids:
+            metrics = self.local_map_coverage_metrics(robot_id)
+            if not metrics["available"]:
+                pieces.append(f"robot_{robot_id}=no_map")
+                all_ready = False
+                continue
+
+            any_map = True
+            ratio_ready = metrics["known_ratio"] >= self.min_local_map_known_ratio_before_goal
+            cells_ready = metrics["known_cells"] >= self.min_local_map_known_cells_before_goal
+            robot_ready = ratio_ready and cells_ready
+            all_ready = all_ready and robot_ready
+            pieces.append(
+                f"robot_{robot_id}={metrics['known_ratio'] * 100:.0f}%/"
+                f"{metrics['known_cells']} cells"
+            )
+
+        summary = ", ".join(pieces)
+        if all_ready:
+            return True, summary
+
+        if any_map and elapsed >= self.max_exploration_before_goal_sec:
+            #  map waiting cap: better to finish with the best evidence than to leave a terminal forever.
+            return True, f"{summary}; cap reached at {elapsed:.1f}s"
+
+        return False, summary
+
+    def local_map_coverage_report_lines(self):
+        """Return compact coverage lines for the saved final summary."""
+        lines = [
+            f"map_gate_min_known_ratio: {self.min_local_map_known_ratio_before_goal:.3f}",
+            f"map_gate_min_known_cells: {self.min_local_map_known_cells_before_goal}",
+            f"goal_stability_min_observations: {self.min_goal_observations_before_acceptance}",
+            f"goal_stability_cluster_radius_m: {self.goal_observation_cluster_radius_m:.3f}",
+            f"goal_heuristic_rejection_radius_m: {self.goal_heuristic_rejection_radius_m:.3f}",
+        ]
+        for robot_id in self.robot_ids_expected_for_mapping():
+            metrics = self.local_map_coverage_metrics(robot_id)
+            if not metrics["available"]:
+                lines.append(f"robot_{robot_id}_local_map_coverage: no_map")
+            else:
+                lines.append(
+                    f"robot_{robot_id}_local_map_coverage: "
+                    f"{metrics['known_ratio'] * 100:.1f}% "
+                    f"({metrics['known_cells']}/{metrics['total_cells']} roi cells known)"
+                )
+        return lines
+
+    def remember_goal_observation(self, msg, robot_id):
+        """Keep recent visual goal points around until they form a stable cluster."""
+        history = self.goal_observation_history.setdefault(robot_id, deque())
+        history.append((time.monotonic(), msg))
+        cutoff = time.monotonic() - self.goal_observation_window_sec
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def goal_selection_frame(self):
+        """Choose one frame for comparing goal observations from both robots."""
+        if self.merged_map_msg is not None and self.merged_map_msg.header.frame_id:
+            return self.normalize_frame_id(self.merged_map_msg.header.frame_id)
+        if self.map_msgs:
+            first_map = self.map_msgs[min(self.map_msgs.keys())]
+            if first_map.header.frame_id:
+                return self.normalize_frame_id(first_map.header.frame_id)
+        return "robot1/odom"
+
+    def point_msg_xy_in_goal_frame(self, msg, robot_id, target_frame):
+        """Transform a target point into the frame used by goal clustering."""
+        source_frame = msg.header.frame_id or f"robot{robot_id}/odom"
+        transformed = self.transform_xy_to_frame(
+            msg.point.x,
+            msg.point.y,
+            source_frame,
+            target_frame,
+        )
+        if transformed is not None:
+            return transformed
+
+        if self.normalize_frame_id(source_frame) == self.normalize_frame_id(target_frame):
+            return msg.point.x, msg.point.y
+        return None
+
+    def goal_observations_for_selection(self, target_frame):
+        """Return recent goal observations projected into one frame."""
+        observations = []
+        for robot_id, history in self.goal_observation_history.items():
+            for wall_stamp, msg in history:
+                xy = self.point_msg_xy_in_goal_frame(msg, robot_id, target_frame)
+                if xy is None:
+                    continue
+                observations.append({
+                    "robot_id": robot_id,
+                    "wall_stamp": wall_stamp,
+                    "msg": msg,
+                    "x": xy[0],
+                    "y": xy[1],
+                })
+        return observations
+
+    def heuristic_points_for_selection(self, target_frame):
+        """Return the current bottle-clue locations in the goal selection frame."""
+        points = []
+        for robot_id, msg in self.heuristic_target_msgs.items():
+            xy = self.point_msg_xy_in_goal_frame(msg, robot_id, target_frame)
+            if xy is not None:
+                points.append(xy)
+        return points
+
+    def cluster_near_heuristic(self, mean_x, mean_y, heuristic_points):
+        """Reject clusters that are probably bottle caps, not the final sphere."""
+        if self.goal_heuristic_rejection_radius_m <= 0.0:
+            return False
+        for hx, hy in heuristic_points:
+            if self.euclidean_distance((mean_x, mean_y), (hx, hy)) <= self.goal_heuristic_rejection_radius_m:
+                return True
+        return False
+
+    def select_stable_goal_observation(self):
+        """Return an averaged goal point only after repeated observations agree."""
+        best = None
+        best_count = 0
+        radius = self.goal_observation_cluster_radius_m
+
+        target_frame = self.goal_selection_frame()
+        observations = self.goal_observations_for_selection(target_frame)
+        heuristic_points = self.heuristic_points_for_selection(target_frame)
+
+        for center in observations:
+            cluster = [
+                item
+                for item in observations
+                if self.euclidean_distance(
+                    (center["x"], center["y"]),
+                    (item["x"], item["y"]),
+                ) <= radius
+            ]
+            cluster_count = len(cluster)
+            best_count = max(best_count, cluster_count)
+            if cluster_count < self.min_goal_observations_before_acceptance:
+                continue
+
+            mean_x = sum(item["x"] for item in cluster) / cluster_count
+            mean_y = sum(item["y"] for item in cluster) / cluster_count
+            mean_z = sum(item["msg"].point.z for item in cluster) / cluster_count
+            if self.cluster_near_heuristic(mean_x, mean_y, heuristic_points):
+                #  clue refusing: a goal cluster sitting on a bottle is usually the red cap.
+                continue
+
+            spread = max(
+                self.euclidean_distance((mean_x, mean_y), (item["x"], item["y"]))
+                for item in cluster
+            )
+            newest_item = max(cluster, key=lambda item: item["wall_stamp"])
+            robot_support = len({item["robot_id"] for item in cluster})
+            duration = max(item["wall_stamp"] for item in cluster) - min(item["wall_stamp"] for item in cluster)
+            score = (
+                robot_support,
+                cluster_count,
+                min(duration, self.goal_observation_window_sec),
+                -spread,
+                newest_item["wall_stamp"],
+            )
+            if best is None or score > best[0]:
+                stable_msg = PointStamped()
+                stable_msg.header.stamp = newest_item["msg"].header.stamp
+                stable_msg.header.frame_id = target_frame
+                stable_msg.point.x = mean_x
+                stable_msg.point.y = mean_y
+                stable_msg.point.z = mean_z
+                best = (score, newest_item["robot_id"], stable_msg)
+
+        if best is None:
+            return None, None, best_count
+
+        return best[1], best[2], max(best_count, best[0][1])
+
+    def store_goal_observation(self, msg, robot_id):
+        """Remember an accepted goal observation and share it across robots."""
+        self.goal_target_msgs[robot_id] = msg
+        self.shared_goal_target_msg = msg
+        self.goal_first_seen_wall_times.setdefault(robot_id, time.monotonic())
+        if robot_id not in self.goal_seen_logged:
+            #  goal noticing: one log is enough, the camera publishes this fast.
+            self.get_logger().info(
+                f"goal observation from robot_{robot_id}: "
+                f"({msg.point.x:.2f}, {msg.point.y:.2f})"
+            )
+            self.goal_seen_logged.add(robot_id)
+
+    def accept_pending_goal_if_ready(self):
+        """Promote held goal observations after the exploration window opens."""
+        if not self.pending_goal_target_msgs or not self.goal_acceptance_gate_open():
+            return False
+
+        stable_robot_id, stable_goal_msg, stable_count = self.select_stable_goal_observation()
+        if stable_goal_msg is None:
+            wall_now = time.monotonic()
+            if wall_now >= self.next_goal_gate_log_wall_time:
+                #  goal stabilizing: the sphere point should repeat before it becomes the final answer.
+                self.get_logger().info(
+                    "holding goal observation for stable visual evidence "
+                    f"(stable_goal_cluster={stable_count}/{self.min_goal_observations_before_acceptance})"
+                )
+                self.next_goal_gate_log_wall_time = wall_now + 2.0
+            return False
+
+        #   Goal promoting: use the repeated camera point after maps have moved.
+        self.store_goal_observation(stable_goal_msg, stable_robot_id)
+
+        self.pending_goal_target_msgs.clear()
+        self.pending_shared_goal_target_msg = None
+        self.update_and_publish_final_goal_path(force=True)
+        return True
 
     def get_goal_target_for_robot(self, robot_id):
         """Return this robot's own goal, or the shared demo goal if another robot saw it."""
@@ -712,20 +1086,22 @@ class Coordinator(Node):
 
             svg_path.write_text(self.make_final_path_svg(best), encoding="utf-8")
             png_saved = self.write_final_path_map_png(best, png_path)
+            summary_lines = [
+                f"robot_id: {best['robot_id']}",
+                f"path_kind: {best['path_kind']}",
+                f"map_source: {best['map_source']}",
+                f"path_frame: {best['frame_id']}",
+                f"path_length_m: {best['length_m']:.4f}",
+                f"waypoints: {len(best['path_odom'])}",
+                f"start_xy: ({best['start_odom'][0]:.4f}, {best['start_odom'][1]:.4f})",
+                f"goal_xy: ({best['goal_odom'][0]:.4f}, {best['goal_odom'][1]:.4f})",
+                f"map_png: {png_path if png_saved else 'not saved'}",
+                f"path_svg: {svg_path}",
+                f"path_csv: {csv_path}",
+            ]
+            summary_lines.extend(self.local_map_coverage_report_lines())
             summary_path.write_text(
-                "\n".join([
-                    f"robot_id: {best['robot_id']}",
-                    f"path_kind: {best['path_kind']}",
-                    f"map_source: {best['map_source']}",
-                    f"path_frame: {best['frame_id']}",
-                    f"path_length_m: {best['length_m']:.4f}",
-                    f"waypoints: {len(best['path_odom'])}",
-                    f"start_xy: ({best['start_odom'][0]:.4f}, {best['start_odom'][1]:.4f})",
-                    f"goal_xy: ({best['goal_odom'][0]:.4f}, {best['goal_odom'][1]:.4f})",
-                    f"map_png: {png_path if png_saved else 'not saved'}",
-                    f"path_svg: {svg_path}",
-                    f"path_csv: {csv_path}",
-                ]) + "\n",
+                "\n".join(summary_lines) + "\n",
                 encoding="utf-8",
             )
 
@@ -1116,7 +1492,7 @@ class Coordinator(Node):
             if self.last_plan_kind.get(robot_id) == "goal":
                 simplification_map = self.build_goal_optimistic_search_map(map, grid_res)
             else:
-                simplification_map = self.build_obstacle_avoidance_search_map(map, grid_res)
+                simplification_map = self.build_frontier_search_map(map, grid_res)
             #  path simplifying: the robot follows fewer waypoints, but the route still comes from A*.
             path_cell = self.simplify_path_cells(
                 path_cell,
@@ -1143,13 +1519,13 @@ class Coordinator(Node):
 
         # getting current location
         start_point = x_pos_map, y_pos_map
-        obstacle_avoidance_search_map = self.build_obstacle_avoidance_search_map(map, map_res_m_per_cell)
-        self.apply_keepout_zones(obstacle_avoidance_search_map, keepout_zones, map_width, map_height, map_res_m_per_cell)
+        frontier_search_map = self.build_frontier_search_map(map, map_res_m_per_cell)
+        self.apply_keepout_zones(frontier_search_map, keepout_zones, map_width, map_height, map_res_m_per_cell)
 
         # self.get_logger().info(obstacle_avoidance_search_map)
         # np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
-        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
+        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], frontier_search_map, map_width, map_height) # snap to nearest free space as start point
 
         # getting the goal point
         ranked_frontiers = self.rank_frontiers(map, x_pos_map, y_pos_map, map_width, map_height, heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
@@ -1157,11 +1533,12 @@ class Coordinator(Node):
             self.get_logger().warn("No frontiers found")
             return None
         for goal_point, _score in ranked_frontiers[:50]:
-            path = self.a_star_path(obstacle_avoidance_search_map, start_point, goal_point, map_width, map_height, warn_on_failure=False)
+            path = self.a_star_path(frontier_search_map, start_point, goal_point, map_width, map_height, warn_on_failure=False)
             if path is not None:
                 if robot_id is not None:
                     self.current_frontiers[robot_id] = goal_point
                     self.get_logger().info(f"frontier pt for robot_{robot_id}: {goal_point}")
+                self.get_logger().info("published fast frontier path using inflated raw occupancy grid")
                 return path
 
         raw_search_map = self.build_raw_search_map(map)
@@ -1497,6 +1874,14 @@ class Coordinator(Node):
             self.next_final_path_attempt_wall_time = wall_now + 1.0
         return self.publish_final_goal_path()
 
+    def build_frontier_search_map(self, map, map_res_m_per_cell):
+        """Build a fast obstacle-aware grid for live frontier exploration."""
+        raw_search_map = self.build_raw_search_map(map)
+        inflated_SLAM_map = self.obstacle_inflation(map, PROTECTION_RADIUS, map_res_m_per_cell)
+        #  Frontier hurrying: mapping motion should start quickly; final A* still uses richer evidence.
+        raw_search_map[inflated_SLAM_map >= MAP_OCCUPIED_THRESHOLD] = 100
+        return raw_search_map
+
     def build_obstacle_avoidance_search_map(self, map, map_res_m_per_cell):
         """Build the inflated/smoothed grid used by the A* planner."""
         smoothed_SLAM_map = self.gaussianSmoothing(map, SMOOTHING_KERNEL_SIZE, SMOOTHING_SIGMA)
@@ -1780,26 +2165,26 @@ class Coordinator(Node):
                 neighborhood = np.array(neighborhood, dtype=np.float32)
                 self.smoothedMap[y, x] = np.sum(neighborhood * kernel) # updating the smoothed map
         
-        # with large sigma, the threshold values for the walls get dimmed way down, so we have to recale
-        max_val = np.max(self.smoothedMap) # find teh largest value in the map
+        # With large sigma, wall values get dimmed down, so rescaling keeps occupied cells visible.
+        max_val = np.max(self.smoothedMap) # find the largest value in the map
 
         # Scale everything proportionally
         if max_val != 0:
-            scaled = (self.smoothedMap / max_val) * 100 # the largest value becomes 100, everything else is proportional
+            scaled = (self.smoothedMap / max_val) * 100 # largest value becomes 100, everything else is proportional
         else:
             scaled = self.smoothedMap
 
         scaled[self.smoothedMap == 0] = 0 # 0 stays as 0
-        self.smoothedMap = scaled.astype(np.int8) # convert to integre
+        self.smoothedMap = scaled.astype(np.int8) # convert back to grid integers
        
 
-        self.smoothedMap = self.smoothedMap.astype(np.int8) #cast to make sure we cast to become integers, because OccupancyGrid topic has int8 datatype
-        # now copying over teh hard 100 values from the occupancy grid to make sure sure
+        self.smoothedMap = self.smoothedMap.astype(np.int8) # cast for OccupancyGrid int8 datatype
+        # copying hard wall/unknown values back over the blurred map
         for y in range(0,height):
             for x in range(0,width):
                 if to_smooth_array[y][x] ==100:
                     self.smoothedMap[y][x] = 100
-                if to_smooth_array[y][x] == -1: # we can't smooth over unexplored cells #TODO: we do still include unexplored pixels in the smoothing
+                if to_smooth_array[y][x] == -1: # keep unknown cells unknown after blur spreading
                     self.smoothedMap[y][x] = -1
                 
         return self.smoothedMap
@@ -1831,6 +2216,7 @@ class Coordinator(Node):
 
     def _control_loop_callback(self): # will be called every self.delta_t seconds 
         wall_now = time.monotonic()
+        self.accept_pending_goal_if_ready()
         if self.final_path_msg is None and self.last_path_msgs and wall_now >= self.next_nav_path_republish_wall_time:
             #  path rebroadcasting: late subscribers should still get a waypoint.
             for robot_id, pose_arr_msg in self.last_path_msgs.items():
@@ -1845,6 +2231,7 @@ class Coordinator(Node):
 
         if self.final_path_msg is not None:
             #  Final holding: once the answer exists, every robot should stay parked for the demo.
+            self.publish_final_goal_path()
             self.publish_stop_commands()
             return
 
@@ -1885,7 +2272,7 @@ def main(args=None):
         coordinator.start()
         rclpy.spin(coordinator)
     except KeyboardInterrupt:
-        coordinator.get_logger().error("ROS node interrupted.")
+        coordinator.get_logger().info("ROS node interrupted during normal shutdown.")
     finally:
         coordinator.destroy_node()
         if rclpy.ok():

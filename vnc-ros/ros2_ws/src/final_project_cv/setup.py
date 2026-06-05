@@ -30,6 +30,7 @@ setup(
             "target_trace_recorder = final_project_cv.target_trace_recorder_node:main",
             "video_source = final_project_cv.video_source_node:main",
             "vision_target_detector = final_project_cv.vision_target_detector_node:main",
+            "demo_finalizer = final_project_cv.demo_finalizer_node:main",
         ],
     },
 )
