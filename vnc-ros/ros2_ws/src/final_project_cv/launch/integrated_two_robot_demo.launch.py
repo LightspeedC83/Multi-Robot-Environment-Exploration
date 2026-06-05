@@ -51,18 +51,40 @@ def cleanup_previous_demo():
             "bash",
             "-lc",
             (
+                "ps -eo pid=,etimes=,args= | "
+                "awk '/[r]os2 launch final_project_cv integrated_two_robot_demo.launch.py/ && $2 > 5 {print $1}' | "
+                "xargs -r kill -9 || true; "
                 "pkill -9 -f '[g]azebo' || true; "
                 "pkill -9 -f '[g]zserver' || true; "
                 "pkill -9 -f '[g]zclient' || true; "
-                "pkill -f '[m]apper.py' || true; "
-                "pkill -f '[c]oordinator.py' || true; "
-                "pkill -f '[m]ap_merger_node' || true; "
-                "pkill -f '[v]ision_target_detector' || true; "
-                "pkill -f '[t]arget_localizer' || true; "
-                "pkill -f '[s]tatic_transform_publisher' || true"
+                "pkill -9 -f '[m]apper.py' || true; "
+                "pkill -9 -f '[c]oordinator.py' || true; "
+                "pkill -9 -f '[m]ap_merger_node' || true; "
+                "pkill -9 -f '[v]ision_target_detector' || true; "
+                "pkill -9 -f '[t]arget_localizer' || true; "
+                "pkill -9 -f '[s]tatic_transform_publisher' || true; "
+                "ros2 daemon stop || true; "
+                "rm -f /root/.gazebo/gui.ini"
             ),
         ],
         condition=IfCondition(LaunchConfiguration("fresh_start")),
+        output="screen",
+    )
+
+
+def gazebo_top_down_camera_reset():
+    return ExecuteProcess(
+        cmd=[
+            "bash",
+            "-lc",
+            (
+                "timeout 1 gz topic "
+                "-t /gazebo/lightweight_targets/user_camera/pose "
+                "-m gazebo.msgs.Pose "
+                "-p 'position { x: 0 y: 0 z: 8 } "
+                "orientation { x: 0 y: 0.7071068 z: 0 w: 0.7071068 }' || true"
+            ),
+        ],
         output="screen",
     )
 
@@ -158,17 +180,23 @@ def generate_launch_description():
         TimerAction(period=1.0, actions=[
             IncludeLaunchDescription(PythonLaunchDescriptionSource(gazebo_launch)),
         ]),
-        TimerAction(period=2.0, actions=[
+        TimerAction(period=3.0, actions=[
+            gazebo_top_down_camera_reset(),
+        ]),
+        TimerAction(period=5.5, actions=[
+            gazebo_top_down_camera_reset(),
+        ]),
+        TimerAction(period=1.5, actions=[
             coordinator_process(),
             map_merger_node(),
         ]),
-        TimerAction(period=3.0, actions=[
+        TimerAction(period=2.2, actions=[
             mapper_process("robot1"),
         ]),
-        TimerAction(period=4.0, actions=[
+        TimerAction(period=2.6, actions=[
             mapper_process("robot2"),
         ]),
-        TimerAction(period=4.0, actions=[
+        TimerAction(period=3.2, actions=[
             cv_pipeline("robot1", pipeline_launch),
             cv_pipeline("robot2", pipeline_launch),
         ]),

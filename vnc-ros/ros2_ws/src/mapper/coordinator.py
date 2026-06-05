@@ -83,7 +83,7 @@ FRONTIER_RAYCAST_ANGULAR_RESOLUTION = 10 # degrees between rays in raycast simul
 FREQUENCY = 5 #Hz.
 
 USE_SIM_TIME = True
-STARTUP_TIMEOUT = 4.0 # s. Max wait for simulator/controller startup.
+STARTUP_TIMEOUT = 1.0 # s. Max wait for simulator/controller startup.
 DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC = 45.0 # demo breathing before an early camera hit freezes motion.
 
 
@@ -1167,7 +1167,7 @@ class Coordinator(Node):
             if self.last_plan_kind.get(robot_id) == "goal":
                 simplification_map = self.build_goal_optimistic_search_map(map, grid_res)
             else:
-                simplification_map = self.build_obstacle_avoidance_search_map(map, grid_res)
+                simplification_map = self.build_frontier_search_map(map, grid_res)
             #  path simplifying: the robot follows fewer waypoints, but the route still comes from A*.
             path_cell = self.simplify_path_cells(
                 path_cell,
@@ -1194,13 +1194,13 @@ class Coordinator(Node):
 
         # getting current location
         start_point = x_pos_map, y_pos_map
-        obstacle_avoidance_search_map = self.build_obstacle_avoidance_search_map(map, map_res_m_per_cell)
-        self.apply_keepout_zones(obstacle_avoidance_search_map, keepout_zones, map_width, map_height, map_res_m_per_cell)
+        frontier_search_map = self.build_frontier_search_map(map, map_res_m_per_cell)
+        self.apply_keepout_zones(frontier_search_map, keepout_zones, map_width, map_height, map_res_m_per_cell)
 
         # self.get_logger().info(obstacle_avoidance_search_map)
         # np.save('./map_data_pa4.npy', obstacle_avoidance_search_map) # saving the smoothed map
 
-        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], obstacle_avoidance_search_map, map_width, map_height) # snap to nearest free space as start point
+        start_point = self.get_nearest_free_cell(start_point[0], start_point[1], frontier_search_map, map_width, map_height) # snap to nearest free space as start point
 
         # getting the goal point
         ranked_frontiers = self.rank_frontiers(map, x_pos_map, y_pos_map, map_width, map_height, heuristic_cell=heuristic_cell, keepout_zones=keepout_zones, map_res_m_per_cell=map_res_m_per_cell)
@@ -1208,11 +1208,12 @@ class Coordinator(Node):
             self.get_logger().warn("No frontiers found")
             return None
         for goal_point, _score in ranked_frontiers[:50]:
-            path = self.a_star_path(obstacle_avoidance_search_map, start_point, goal_point, map_width, map_height, warn_on_failure=False)
+            path = self.a_star_path(frontier_search_map, start_point, goal_point, map_width, map_height, warn_on_failure=False)
             if path is not None:
                 if robot_id is not None:
                     self.current_frontiers[robot_id] = goal_point
                     self.get_logger().info(f"frontier pt for robot_{robot_id}: {goal_point}")
+                self.get_logger().info("published fast frontier path using inflated raw occupancy grid")
                 return path
 
         raw_search_map = self.build_raw_search_map(map)
@@ -1547,6 +1548,14 @@ class Coordinator(Node):
             self.update_final_goal_path()
             self.next_final_path_attempt_wall_time = wall_now + 1.0
         return self.publish_final_goal_path()
+
+    def build_frontier_search_map(self, map, map_res_m_per_cell):
+        """Build a fast obstacle-aware grid for live frontier exploration."""
+        raw_search_map = self.build_raw_search_map(map)
+        inflated_SLAM_map = self.obstacle_inflation(map, PROTECTION_RADIUS, map_res_m_per_cell)
+        #  Frontier hurrying: mapping motion should start quickly; final A* still uses richer evidence.
+        raw_search_map[inflated_SLAM_map >= MAP_OCCUPIED_THRESHOLD] = 100
+        return raw_search_map
 
     def build_obstacle_avoidance_search_map(self, map, map_res_m_per_cell):
         """Build the inflated/smoothed grid used by the A* planner."""
@@ -1897,6 +1906,7 @@ class Coordinator(Node):
 
         if self.final_path_msg is not None:
             #  Final holding: once the answer exists, every robot should stay parked for the demo.
+            self.publish_final_goal_path()
             self.publish_stop_commands()
             return
 
