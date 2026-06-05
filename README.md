@@ -68,7 +68,7 @@ The launch defaults to `fresh_start:=true`, so stale Gazebo and ROS demo process
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
 ```
 
-The launch also holds very early goal detections for `min_exploration_before_goal_sec:=24.0` seconds. This makes the video demo show frontier exploration and map growth before the stored goal observation triggers the final shortest A* start-to-goal path and `/mission_complete` stop.
+The launch also holds very early goal detections for `min_exploration_before_goal_sec:=45.0` seconds. This makes the video demo show frontier exploration and map growth before the stored goal observation triggers the final shortest A* start-to-goal path and `/mission_complete` stop.
 
 ```bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0

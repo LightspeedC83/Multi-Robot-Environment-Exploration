@@ -80,7 +80,7 @@ The launch starts Gazebo, both robot mappers/controllers, the coordinator, map m
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
 ```
 
-The default run uses `min_exploration_before_goal_sec:=24.0`, so a goal seen immediately by the camera is held briefly while both robots begin frontier exploration. Lower it for a faster final answer:
+The default run uses `min_exploration_before_goal_sec:=45.0`, so a goal seen immediately by the camera is held briefly while both robots begin frontier exploration. Lower it for a faster final answer:
 
 ```bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0

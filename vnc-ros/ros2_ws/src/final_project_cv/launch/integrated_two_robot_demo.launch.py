@@ -150,7 +150,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "min_exploration_before_goal_sec",
-            default_value="24.0",
+            default_value="45.0",
             description="Hold early goal detections this long so frontier exploration is visible before final A* stop.",
         ),
         #  gazebo reloading: old GUI sessions keep model poses, so clean them before a new take.

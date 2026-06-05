@@ -99,7 +99,7 @@ source install/setup.bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-The integrated launch holds early goal observations for `min_exploration_before_goal_sec:=24.0` seconds. During that window the coordinator still serves frontier paths, so map growth is visible before the final shortest A* path is published and `/mission_complete` stops the robots.
+The integrated launch holds early goal observations for `min_exploration_before_goal_sec:=45.0` seconds. During that window the coordinator still serves frontier paths, so map growth is visible before the final shortest A* path is published and `/mission_complete` stops the robots.
 
 For map evidence:
 

@@ -84,7 +84,7 @@ FREQUENCY = 5 #Hz.
 
 USE_SIM_TIME = True
 STARTUP_TIMEOUT = 4.0 # s. Max wait for simulator/controller startup.
-DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC = 24.0 # demo breathing before an early camera hit freezes motion.
+DEFAULT_MIN_EXPLORATION_BEFORE_GOAL_SEC = 45.0 # demo breathing before an early camera hit freezes motion.
 
 
 class Coordinator(Node):
