@@ -1,6 +1,8 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, TimerAction
+from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, IncludeLaunchDescription, RegisterEventHandler, TimerAction
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -51,19 +53,8 @@ def cleanup_previous_demo():
             "bash",
             "-lc",
             (
-                "ps -eo pid=,etimes=,args= | "
-                "awk '/[r]os2 launch final_project_cv integrated_two_robot_demo.launch.py/ && $2 > 5 {print $1}' | "
-                "xargs -r kill -9 || true; "
-                "pkill -9 -f '[g]azebo' || true; "
-                "pkill -9 -f '[g]zserver' || true; "
-                "pkill -9 -f '[g]zclient' || true; "
-                "pkill -9 -f '[m]apper.py' || true; "
-                "pkill -9 -f '[c]oordinator.py' || true; "
-                "pkill -9 -f '[m]ap_merger_node' || true; "
-                "pkill -9 -f '[v]ision_target_detector' || true; "
-                "pkill -9 -f '[t]arget_localizer' || true; "
-                "pkill -9 -f '[s]tatic_transform_publisher' || true; "
-                "ros2 daemon stop || true; "
+                "python3 /root/ros2_ws/src/final_project_cv/tools/cleanup_demo_processes.py --quiet; "
+                "/opt/ros/humble/bin/ros2 daemon stop || true; "
                 "rm -f /root/.gazebo/gui.ini"
             ),
         ],
@@ -106,6 +97,28 @@ def map_merger_node():
     )
 
 
+def demo_finalizer_node():
+    return Node(
+        package="final_project_cv",
+        executable="demo_finalizer",
+        name="demo_finalizer",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("auto_finalize")),
+        parameters=[{
+            "results_dir": "/root/ros2_ws/src/final_path_results",
+            "tools_dir": "/root/ros2_ws/src/final_project_cv/tools",
+            "snapshot_seconds": ParameterValue(
+                LaunchConfiguration("finalizer_snapshot_seconds"),
+                value_type=float,
+            ),
+            "shutdown_on_complete": ParameterValue(
+                LaunchConfiguration("shutdown_after_finalize"),
+                value_type=bool,
+            ),
+        }],
+    )
+
+
 def cv_pipeline(robot_namespace, pipeline_launch):
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(pipeline_launch),
@@ -133,6 +146,7 @@ def generate_launch_description():
         "launch",
         "dual_target_tracking_pipeline.launch.py",
     ])
+    finalizer = demo_finalizer_node()
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -175,6 +189,21 @@ def generate_launch_description():
             default_value="45.0",
             description="Hold early goal detections this long so frontier exploration is visible before final A* stop.",
         ),
+        DeclareLaunchArgument(
+            "auto_finalize",
+            default_value="true",
+            description="Capture report evidence, generate visuals, and end the launch after /mission_complete.",
+        ),
+        DeclareLaunchArgument(
+            "finalizer_snapshot_seconds",
+            default_value="5.0",
+            description="Seconds to collect final map and CV snapshots after /mission_complete.",
+        ),
+        DeclareLaunchArgument(
+            "shutdown_after_finalize",
+            default_value="true",
+            description="End the integrated launch after final artifacts are generated.",
+        ),
         #  gazebo reloading: old GUI sessions keep model poses, so clean them before a new take.
         cleanup_previous_demo(),
         TimerAction(period=1.0, actions=[
@@ -189,6 +218,7 @@ def generate_launch_description():
         TimerAction(period=1.5, actions=[
             coordinator_process(),
             map_merger_node(),
+            finalizer,
         ]),
         TimerAction(period=2.2, actions=[
             mapper_process("robot1"),
@@ -200,4 +230,13 @@ def generate_launch_description():
             cv_pipeline("robot1", pipeline_launch),
             cv_pipeline("robot2", pipeline_launch),
         ]),
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=finalizer,
+                on_exit=[
+                    EmitEvent(event=Shutdown(reason="integrated demo finalized")),
+                ],
+            ),
+            condition=IfCondition(LaunchConfiguration("auto_finalize")),
+        ),
     ])

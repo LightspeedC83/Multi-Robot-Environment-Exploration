@@ -80,10 +80,16 @@ The launch starts Gazebo, both robot mappers/controllers, the coordinator, map m
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
 ```
 
-The default run uses `min_exploration_before_goal_sec:=45.0`, so a goal seen immediately by the camera is held briefly while both robots begin frontier exploration. Lower it for a faster final answer:
+The default run uses `min_exploration_before_goal_sec:=45.0`, so a goal seen immediately by the camera is held briefly while both robots begin frontier exploration. This is a minimum exploration window; after it passes, the demo still waits until the final A* answer exists, captures a few seconds of evidence, prints `RESULTS READY`, and exits. Lower it for a faster final answer:
 
 ```bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0
+```
+
+After the final path is published, `auto_finalize:=true` captures final map/CV snapshots, regenerates the report visuals, prints `RESULTS READY`, and ends the launch. Disable it when you want Gazebo/RViz to stay open:
+
+```bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py auto_finalize:=false
 ```
 
 Lower-load detection option:

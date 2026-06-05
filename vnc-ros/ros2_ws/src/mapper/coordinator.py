@@ -175,7 +175,7 @@ class Coordinator(Node):
         self.final_marker_publisher = self.create_publisher(MarkerArray, "/final_result_markers", latched_qos)
         self.legacy_final_path_publisher = self.create_publisher(PoseArray, "/final_goal_to_start_path", latched_qos)
         self.legacy_final_nav_path_publisher = self.create_publisher(NavPath, "/final_goal_to_start_nav_path", latched_qos)
-        self.mission_complete_publisher = self.create_publisher(Bool, "/mission_complete", 1)
+        self.mission_complete_publisher = self.create_publisher(Bool, "/mission_complete", latched_qos)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -1947,7 +1947,7 @@ def main(args=None):
         coordinator.start()
         rclpy.spin(coordinator)
     except KeyboardInterrupt:
-        coordinator.get_logger().error("ROS node interrupted.")
+        coordinator.get_logger().info("ROS node interrupted during normal shutdown.")
     finally:
         coordinator.destroy_node()
         if rclpy.ok():

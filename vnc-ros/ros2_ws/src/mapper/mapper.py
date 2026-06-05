@@ -176,7 +176,13 @@ class WorldMapper(Node):
         ## setting up service clients ##
         self.nav_path_client = self.create_client(GetNewFrontierPath, self.path_service_name) # getting path from coordinator
         self.nav_path_listener = self.create_subscription(PoseArray, self._topic_from_template(self.path_topic_template), self._nav_path_callback, 1)
-        self._mission_complete_sub = self.create_subscription(Bool, self.mission_complete_topic, self._mission_complete_callback, 1)
+        mission_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._mission_complete_sub = self.create_subscription(Bool, self.mission_complete_topic, self._mission_complete_callback, mission_qos)
         self.waiting_for_path_request = False
 
         ### Setting up publishers/subscribers. ###
@@ -1435,7 +1441,7 @@ def main(args=None):
         rclpy.spin(world_mapper)
     except KeyboardInterrupt:
         world_mapper.shutdown_mapper()
-        world_mapper.get_logger().error("ROS node interrupted.")
+        world_mapper.get_logger().info("ROS node interrupted during normal shutdown.")
     finally:
         if rclpy.ok():
             world_mapper.stop()

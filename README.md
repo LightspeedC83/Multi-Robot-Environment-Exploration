@@ -68,10 +68,16 @@ The launch defaults to `fresh_start:=true`, so stale Gazebo and ROS demo process
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py fresh_start:=false
 ```
 
-The launch also holds very early goal detections for `min_exploration_before_goal_sec:=45.0` seconds. This makes the video demo show frontier exploration and map growth before the stored goal observation triggers the final shortest A* start-to-goal path and `/mission_complete` stop.
+The launch also holds very early goal detections for `min_exploration_before_goal_sec:=45.0` seconds. This is a minimum exploration window, not an exact program-end timestamp: once the gate has passed and a final A* path exists, `/mission_complete` stops the robots, the finalizer captures a few seconds of map/CV evidence, prints `RESULTS READY`, and exits.
 
 ```bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0
+```
+
+After `/mission_complete`, the default launch captures final map/CV snapshots, generates the report visual pack, prints `RESULTS READY`, and shuts the demo down. For a manual RViz session that keeps running:
+
+```bash
+ros2 launch final_project_cv integrated_two_robot_demo.launch.py auto_finalize:=false
 ```
 
 ## Evidence Windows

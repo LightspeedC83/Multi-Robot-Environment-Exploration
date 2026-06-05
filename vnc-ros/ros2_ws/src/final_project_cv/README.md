@@ -72,11 +72,13 @@ source install/setup.bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py
 ```
 
-By default, early goal detections are held for `min_exploration_before_goal_sec:=45.0` seconds so the demo shows frontier exploration before the final A* stop. For a faster result:
+By default, early goal detections are held for `min_exploration_before_goal_sec:=45.0` seconds so the demo shows frontier exploration before the final A* stop. This is a minimum exploration window; after it passes, the demo still waits until the final A* answer exists, captures a few seconds of evidence, prints `RESULTS READY`, and exits. For a faster result:
 
 ```bash
 ros2 launch final_project_cv integrated_two_robot_demo.launch.py min_exploration_before_goal_sec:=12.0
 ```
+
+The integrated launch also defaults to `auto_finalize:=true`: after `/mission_complete`, it captures final snapshots, regenerates the report visual pack, prints `RESULTS READY`, and shuts down. Use `auto_finalize:=false` for manual visualization sessions.
 
 Gazebo world only:
 
