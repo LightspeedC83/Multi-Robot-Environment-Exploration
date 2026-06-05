@@ -53,7 +53,7 @@ MAP_CLEAR_THRESHOLD = 33 # program treats any value below this as free space
 MAP_OCCUPIED_THRESHOLD = 80 # program treats any value above this as occupied and to be avoided
 
 CLUSTER_CELL_RADIUS = 5  # radius in cells to group frontier cells into clusters
-FRONTIER_RAYCAST_WEIGHT = 0.5  # weight for unknown cells visible in score equation
+FRONTIER_RAYCAST_WEIGHT = 1  # weight for unknown cells visible in score equation
 FRONTIER_RAYCAST_RANGE_CELLS = 30  # max range in cells for raycast simulation
 FRONTIER_RAYCAST_ANGULAR_RESOLUTION = 10  # degrees between rays in raycast simulation
 

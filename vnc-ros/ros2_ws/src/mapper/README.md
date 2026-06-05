@@ -98,7 +98,9 @@ the coordinator runs 2 services:
 
 # Todo:
 - cut the path off at where the robot is right now for the start
+    - do this at every key point, not just when robot receives the path
 - probably offload recovery path calculations to the coordinator
 - if A* can't pathfind to the best frontier, we shouldn't just assume we're done, we should try with next best frontier, etc.
+- p
 
 
