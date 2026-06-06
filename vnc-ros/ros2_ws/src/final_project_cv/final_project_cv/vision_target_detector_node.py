@@ -44,6 +44,87 @@ def bbox_iou(a, b):
     return intersection / union
 
 
+def bbox_horizontal_overlap(a, b):
+    ax1, _, ax2, _ = a
+    bx1, _, bx2, _ = b
+    return max(0.0, min(ax2, bx2) - max(ax1, bx1))
+
+
+def looks_like_bottle_cap(ball_detection, bottle_detection):
+    """Return true when an orange blob is probably the cap on a detected bottle."""
+    ball = ball_detection["bbox"]
+    bottle = bottle_detection["bbox"]
+    bx1, by1, bx2, by2 = ball
+    tx1, ty1, tx2, ty2 = bottle
+
+    ball_width = max(1.0, bx2 - bx1)
+    ball_height = max(1.0, by2 - by1)
+    bottle_width = max(1.0, tx2 - tx1)
+    bottle_height = max(1.0, ty2 - ty1)
+
+    overlap = bbox_horizontal_overlap(ball, bottle)
+    centered_on_bottle = overlap >= 0.35 * min(ball_width, bottle_width)
+    ball_cx = (bx1 + bx2) / 2.0
+    ball_cy = (by1 + by2) / 2.0
+    top_margin = max(18.0, 0.22 * bottle_height)
+    side_margin = max(8.0, 0.35 * bottle_width)
+    center_above_bottle = (tx1 - side_margin) <= ball_cx <= (tx2 + side_margin)
+    near_bottle_top = (
+        (ty1 - top_margin) <= ball_cy <= (ty1 + 0.40 * bottle_height)
+        or (by2 >= ty1 - top_margin and by1 <= ty1 + 0.32 * bottle_height)
+    )
+    cap_sized = ball_height <= 0.65 * bottle_height and ball_width <= 1.7 * bottle_width
+    #  cap catching: the orange cap may float a few pixels above the blue body after color masking.
+    return (centered_on_bottle or center_above_bottle) and near_bottle_top and cap_sized
+
+
+def looks_embedded_in_bottle_column(ball_detection, bottle_detection):
+    """Return true when the goal-looking blob is really part of the bottle silhouette."""
+    ball = ball_detection["bbox"]
+    bottle = bottle_detection["bbox"]
+    bx1, by1, bx2, by2 = ball
+    tx1, ty1, tx2, ty2 = bottle
+
+    ball_cx, ball_cy = bbox_center(ball)
+    ball_width = max(1.0, bx2 - bx1)
+    bottle_width = max(1.0, tx2 - tx1)
+    bottle_height = max(1.0, ty2 - ty1)
+    x_margin = max(7.0, 0.24 * bottle_width)
+    y_margin = max(10.0, 0.08 * bottle_height)
+    overlap = bbox_horizontal_overlap(ball, bottle)
+
+    within_column = (
+        (tx1 - x_margin) <= ball_cx <= (tx2 + x_margin)
+        or overlap >= 0.30 * min(ball_width, bottle_width)
+    )
+    within_body_height = (ty1 - y_margin) <= ball_cy <= (ty2 + 0.10 * bottle_height)
+    #  body borrowing: orange pixels on a bottle should guide search, not become the final goal.
+    return within_column and within_body_height
+
+
+def goal_candidate_shape_is_plausible(detection):
+    """Return true when a synthetic sports-ball blob is round enough to trust."""
+    x1, y1, x2, y2 = detection["bbox"]
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    ratio = width / height
+    return 0.55 <= ratio <= 1.85
+
+
+def goal_candidate_touches_frame_edge(detection, frame_shape, margin_px=3.0):
+    """Return true when the ball is clipped by the image boundary."""
+    if frame_shape is None:
+        return False
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = detection["bbox"]
+    return (
+        x1 <= margin_px
+        or y1 <= margin_px
+        or x2 >= width - margin_px
+        or y2 >= height - margin_px
+    )
+
+
 def mask_measurement(mask):
     ys, xs = np.where(mask > 0.5)
 
@@ -206,8 +287,6 @@ class VisionTargetDetector(Node):
         self.declare_parameter("publish_debug_image", True)
         self.declare_parameter("draw_all_detections", True)
         self.declare_parameter("display_classes", "bottle,sports ball")
-        self.declare_parameter("use_sim_bottle_color_fallback", True)
-        self.declare_parameter("sim_bottle_min_area", 25.0)
         self.declare_parameter("yolo_conf", 0.25)
         self.declare_parameter("fastsam_conf", 0.4)
         self.declare_parameter("fastsam_iou", 0.9)
@@ -219,6 +298,8 @@ class VisionTargetDetector(Node):
         self.declare_parameter("torch_threads", 2)
         self.declare_parameter("fuse_yolo_model", True)
         self.declare_parameter("disable_nnpack", True)
+        self.declare_parameter("save_first_goal_evidence", True)
+        self.declare_parameter("first_goal_evidence_dir", "/root/ros2_ws/src/final_path_results/snapshots")
 
         self.image_topic = self.get_parameter("image_topic").value
         self.centroid_topic = self.get_parameter("centroid_topic").value
@@ -231,10 +312,6 @@ class VisionTargetDetector(Node):
         self.publish_debug_image = parameter_as_bool(self.get_parameter("publish_debug_image").value)
         self.draw_all_detections = parameter_as_bool(self.get_parameter("draw_all_detections").value)
         self.display_classes = parse_class_list(self.get_parameter("display_classes").value)
-        self.use_sim_bottle_color_fallback = parameter_as_bool(
-            self.get_parameter("use_sim_bottle_color_fallback").value
-        )
-        self.sim_bottle_min_area = float(self.get_parameter("sim_bottle_min_area").value)
         self.yolo_conf = float(self.get_parameter("yolo_conf").value)
         self.fastsam_conf = float(self.get_parameter("fastsam_conf").value)
         self.fastsam_iou = float(self.get_parameter("fastsam_iou").value)
@@ -246,6 +323,8 @@ class VisionTargetDetector(Node):
         self.torch_threads = int(self.get_parameter("torch_threads").value)
         self.fuse_yolo_model = parameter_as_bool(self.get_parameter("fuse_yolo_model").value)
         self.disable_nnpack = parameter_as_bool(self.get_parameter("disable_nnpack").value)
+        self.save_first_goal_evidence = parameter_as_bool(self.get_parameter("save_first_goal_evidence").value)
+        self.first_goal_evidence_dir = Path(str(self.get_parameter("first_goal_evidence_dir").value))
 
         if self.process_every_n < 1:
             raise ValueError("process_every_n must be >= 1")
@@ -257,11 +336,13 @@ class VisionTargetDetector(Node):
         self.configure_torch_threads()
         self.detector = load_yolo_model(self.yolo_weights) if self.use_yolo else None
         self.fuse_detector_if_requested()
-        self.segmenter = load_fastsam_model(self.fastsam_weights) if self.use_fastsam else None
+        self.segmenter = None
+        self.fastsam_load_failed = False
         self.frame_count = 0
         self.tracked_bbox = None
         self.tracked_centroid = None
         self.tracked_diameter = None
+        self.first_goal_evidence_saved = False
 
         self.image_subscriber = self.create_subscription(
             Image,
@@ -301,6 +382,23 @@ class VisionTargetDetector(Node):
         except Exception as exc:
             self.get_logger().debug(f"Could not fuse YOLO model: {exc}")
 
+    def fastsam_model(self):
+        if not self.use_fastsam:
+            return None
+        if self.segmenter is not None:
+            return self.segmenter
+        if self.fastsam_load_failed:
+            return None
+
+        try:
+            # lazy loading: RViz gets debug images right away, then masks arrive when a target exists.
+            self.segmenter = load_fastsam_model(self.fastsam_weights)
+            self.get_logger().info(f"FastSAM mask refinement loaded from '{self.fastsam_weights}'")
+        except Exception as exc:
+            self.fastsam_load_failed = True
+            self.get_logger().warn(f"FastSAM could not be loaded; using YOLO bbox measurements: {exc}")
+        return self.segmenter
+
     def image_callback(self, msg):
         self.frame_count += 1
         if self.frame_count % self.process_every_n != 0:
@@ -318,13 +416,16 @@ class VisionTargetDetector(Node):
                 verbose=False,
             )
             all_detections.extend(self.get_all_detections(yolo_results[0]))
-        if self.use_sim_bottle_color_fallback:
-            all_detections.extend(self.detect_sim_color_targets(processed_frame))
 
         visible_detections = [
             detection for detection in all_detections
             if detection["class_name"] in self.display_classes
         ]
+        if self.target == "sports ball":
+            visible_detections = self.reject_bottle_cap_goal_candidates(
+                visible_detections,
+                processed_frame.shape,
+            )
         detections = [
             detection for detection in visible_detections
             if detection["class_name"] == self.target
@@ -377,7 +478,8 @@ class VisionTargetDetector(Node):
             selected["class_name"],
             measurement_source,
         )
-        self.publish_debug_frame(
+        debug_detections = self.debug_detections_for_frame(visible_detections, selected)
+        debug_frame = self.publish_debug_frame(
             msg,
             processed_frame,
             bbox,
@@ -385,9 +487,10 @@ class VisionTargetDetector(Node):
             confidence,
             mask,
             target_class=selected["class_name"],
-            all_detections=visible_detections,
+            all_detections=debug_detections,
             measurement_source=measurement_source,
         )
+        self.save_first_goal_evidence_images(frame, debug_frame, selected["class_name"])
 
     def project_detection_summary(self, detections):
         messages = []
@@ -403,6 +506,64 @@ class VisionTargetDetector(Node):
             messages.append(f"{project_detection_message(class_name)} ({best['confidence']:.2f})")
 
         return " | ".join(messages)
+
+    def reject_bottle_cap_goal_candidates(self, detections, frame_shape=None):
+        """Remove cap-like YOLO sports-ball candidates near bottle detections."""
+        bottles = [detection for detection in detections if detection["class_name"] == "bottle"]
+
+        filtered = []
+        rejected_count = 0
+        for detection in detections:
+            if detection["class_name"] != "sports ball":
+                filtered.append(detection)
+                continue
+
+            if not goal_candidate_shape_is_plausible(detection):
+                #  shape waiting: clipped orange streaks should not lock the stored goal.
+                rejected_count += 1
+                continue
+
+            if goal_candidate_touches_frame_edge(detection, frame_shape):
+                #  edge waiting: a partial sphere gives noisy range/centroid evidence.
+                rejected_count += 1
+                continue
+
+            if bottles and any(
+                    looks_like_bottle_cap(detection, bottle)
+                    or looks_embedded_in_bottle_column(detection, bottle)
+                    for bottle in bottles
+            ):
+                #  cap rejecting: blue bottle clues have orange tops, but they are not the final sphere.
+                rejected_count += 1
+                continue
+
+            filtered.append(detection)
+
+        if rejected_count:
+            self.get_logger().info(
+                f"rejected {rejected_count} orange bottle-cap candidate(s) for goal sphere",
+                throttle_duration_sec=1.0,
+            )
+        return filtered
+
+    def debug_detections_for_frame(self, visible_detections, selected):
+        """Keep goal debug overlays readable by drawing context plus the selected target."""
+        if selected is None or self.target != "sports ball":
+            return visible_detections
+
+        selected_bbox = selected["bbox"]
+        debug_items = []
+        for detection in visible_detections:
+            item = dict(detection)
+            if detection["class_name"] != self.target:
+                item["debug_label"] = False
+                debug_items.append(item)
+                continue
+            if bbox_iou(detection["bbox"], selected_bbox) > 0.80:
+                item["debug_label"] = False
+                debug_items.append(item)
+
+        return debug_items
 
     def get_all_detections(self, result):
         if result.boxes is None or len(result.boxes) == 0:
@@ -429,86 +590,21 @@ class VisionTargetDetector(Node):
 
         return detections
 
-    def detect_sim_color_targets(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # The lightweight Gazebo bottles are deliberately cyan/blue. This
-        # fallback is only for the synthetic world where pretrained YOLO does
-        # not see simple cylinder models as real bottles. The goal ball is
-        # deliberately orange for the same reason.
-        lower_blue = np.array([82, 45, 35], dtype=np.uint8)
-        upper_blue = np.array([112, 255, 235], dtype=np.uint8)
-        lower_orange = np.array([4, 70, 70], dtype=np.uint8)
-        upper_orange = np.array([25, 255, 255], dtype=np.uint8)
-
-        detections = []
-        detections.extend(self.detect_sim_color_components(
-            hsv,
-            lower_blue,
-            upper_blue,
-            class_name="bottle",
-            min_area=self.sim_bottle_min_area,
-            require_tall=True,
-            confidence=0.95,
-        ))
-        detections.extend(self.detect_sim_color_components(
-            hsv,
-            lower_orange,
-            upper_orange,
-            class_name="sports ball",
-            min_area=12.0,
-            require_tall=False,
-            confidence=0.92,
-        ))
-        return detections
-
-    def detect_sim_color_components(self, hsv, lower, upper, class_name, min_area, require_tall, confidence):
-        mask = cv2.inRange(hsv, lower, upper)
-
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detections = []
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < min_area:
-                continue
-
-            x, y, w, h = cv2.boundingRect(contour)
-            if h < 3 or w < 3:
-                continue
-            if require_tall and (h < 10 or h < 1.35 * w):
-                continue
-
-            component_mask = np.zeros(mask.shape, dtype=np.uint8)
-            cv2.drawContours(component_mask, [contour], -1, 255, thickness=cv2.FILLED)
-            bbox = detection_bbox_from_mask(component_mask)
-            if bbox is None:
-                continue
-
-            detections.append({
-                "bbox": bbox,
-                "confidence": confidence,
-                "class_id": -1,
-                "class_name": class_name,
-                "source": "sim_color",
-                "mask": component_mask.astype(np.float32) / 255.0,
-            })
-
-        return detections
-
     def select_detection(self, detections, frame_shape):
         if not detections:
             return None
 
         if self.tracked_bbox is not None:
-            return max(
+            tracked = max(
                 detections,
                 key=lambda item: (bbox_iou(item["bbox"], self.tracked_bbox), item["confidence"]),
             )
+            if bbox_iou(tracked["bbox"], self.tracked_bbox) >= 0.08:
+                return tracked
+            #  tracker letting-go: when the old box is gone, choose from the new frame normally.
+            self.tracked_bbox = None
+            self.tracked_centroid = None
+            self.tracked_diameter = None
 
         height, width = frame_shape[:2]
         frame_center = (width / 2.0, height / 2.0)
@@ -542,8 +638,9 @@ class VisionTargetDetector(Node):
 
         fallback = (bbox_center(bbox), bbox_diameter(bbox), None, "bbox")
 
-        if self.use_fastsam:
-            sam_results = self.segmenter(
+        segmenter = self.fastsam_model()
+        if segmenter is not None:
+            sam_results = segmenter(
                 frame,
                 bboxes=[bbox],
                 imgsz=self.imgsz,
@@ -614,7 +711,7 @@ class VisionTargetDetector(Node):
         measurement_source=None,
     ):
         if not self.publish_debug_image:
-            return
+            return None
 
         debug = frame.copy()
 
@@ -622,16 +719,17 @@ class VisionTargetDetector(Node):
             for detection in all_detections or []:
                 x1, y1, x2, y2 = map(int, detection["bbox"])
                 cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 210, 255), 1)
-                cv2.putText(
-                    debug,
-                    f"{compact_detection_label(detection['class_name'])} {detection['confidence']:.2f}",
-                    (x1, max(15, y1 - 6)),
-                    cv2.FONT_HERSHEY_DUPLEX,
-                    0.32,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
+                if detection.get("debug_label", True):
+                    cv2.putText(
+                        debug,
+                        f"{compact_detection_label(detection['class_name'])} {detection['confidence']:.2f}",
+                        (x1, max(15, y1 - 6)),
+                        cv2.FONT_HERSHEY_DUPLEX,
+                        0.32,
+                        (0, 0, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
 
         if mask is not None:
             mask = resize_mask_to_frame(mask, debug.shape) > 0.5
@@ -692,6 +790,36 @@ class VisionTargetDetector(Node):
         debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")
         debug_msg.header = image_msg.header
         self.debug_image_publisher.publish(debug_msg)
+        return debug
+
+    def robot_evidence_label(self):
+        """Return robot1/robot2 from the namespace for stable report filenames."""
+        namespace = self.get_namespace().strip("/")
+        if namespace:
+            return namespace.replace("/", "_")
+        return "robot"
+
+    def save_first_goal_evidence_images(self, raw_frame, debug_frame, class_name):
+        """Save the first valid goal detection frame before finalizer snapshots overwrite context."""
+        if (
+            self.first_goal_evidence_saved
+            or not self.save_first_goal_evidence
+            or class_name != "sports ball"
+            or self.target != "sports ball"
+            or debug_frame is None
+        ):
+            return
+
+        self.first_goal_evidence_dir.mkdir(parents=True, exist_ok=True)
+        robot_label = self.robot_evidence_label()
+        raw_path = self.first_goal_evidence_dir / f"first_goal_{robot_label}_camera_raw.png"
+        debug_path = self.first_goal_evidence_dir / f"first_goal_{robot_label}_goal_debug.png"
+        cv2.imwrite(str(raw_path), raw_frame)
+        cv2.imwrite(str(debug_path), debug_frame)
+        self.first_goal_evidence_saved = True
+        self.get_logger().info(
+            f"saved first goal CV evidence: raw={raw_path}, debug={debug_path}"
+        )
 
 
 def main(args=None):

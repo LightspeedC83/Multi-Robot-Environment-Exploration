@@ -58,6 +58,21 @@ MIN_INLIERS_FOR_ALIGNMENT = 10
 # corners. We undo this factor when reporting the final transform.
 FEATURE_UPSCALE = 3
 
+# Alignment acceptance is intentionally stricter than the old confidence
+# threshold. Bad merges are more damaging than no merge because the planner
+# may then compute A* through walls that only exist because of a bad transform.
+MIN_WALL_UNION_FOR_ALIGNMENT = 8
+MIN_WALL_AGREEMENT_FOR_ALIGNMENT = 0.58
+MIN_OVERLAP_RATIO_FOR_ALIGNMENT = 0.035
+MAX_OCCUPANCY_CONFLICT_RATIO = 0.42
+MIN_CELLS_BEFORE_PRIOR_MERGE = 300
+
+# A trusted prior comes from outside image matching. In the Gazebo demo the
+# local OccupancyGrid origins are already expressed in the same world-aligned
+# odom coordinates, so this prior is much more stable than ORB on tiny maps.
+TRUSTED_PRIOR_EFFECTIVE_CONFIDENCE = 0.95
+PRIOR_RANKING_BONUS = 0.08
+
 
 # Grid to image
 
@@ -87,7 +102,6 @@ def detect_and_match(img_a, img_b, upscale=FEATURE_UPSCALE,
     #The grids are upscaled before feature detection
     #this code finds matching landmarks/features between the two occupancy maps and keeps only the matches that are distinctive enough to trust.
     """
-    AI suggestion:
     mask_a / mask_b: optional uint8 masks (same shape as img_a / img_b before
     upscaling) that restrict ORB to keypoints inside the known region.
     Important for occupancy-grid matching because the unknown / free boundary
@@ -412,6 +426,8 @@ def alignment_confidence(grid_a, grid_b, transform_2x3, n_inliers):
 
     occ_a = (prob_a >= 0.5) & known_a
     occ_b = (prob_b >= 0.5) & known_b
+    free_a = (prob_a <= 0.35) & known_a
+    free_b = (prob_b <= 0.35) & known_b
 
     # Allow a 1-cell tolerance in the agreement check. ORB+RANSAC routinely
     # produces transforms that are correct to within ~1 pixel of the upscaled
@@ -436,6 +452,19 @@ def alignment_confidence(grid_a, grid_b, transform_2x3, n_inliers):
     else:
         wall_agreement = min(wall_agree_count / wall_union_count, 1.0)
 
+    wall_a_count = int((occ_a & both_known).sum())
+    wall_b_count = int((occ_b & both_known).sum())
+    smaller_wall_count = max(min(wall_a_count, wall_b_count), 1)
+    wall_coverage = min(wall_agree_count / smaller_wall_count, 1.0)
+
+    # A direct wall-vs-free conflict is a stronger signal than free-vs-free
+    # agreement. Wrong rotations often look acceptable only because the empty
+    # floor overlaps; this term catches those false positives.
+    conflict = ((occ_a & free_b) | (occ_b & free_a)) & both_known
+    conflict_count = int(conflict.sum())
+    conflict_ratio = conflict_count / max(wall_union_count, 1)
+    conflict_score = max(0.0, 1.0 - conflict_ratio)
+
     # Down-weight when joint overlap is tiny relative to either input grid.
     a_known_total = int(known_a.sum())
     b_known_total = int(known_b.sum())
@@ -447,24 +476,63 @@ def alignment_confidence(grid_a, grid_b, transform_2x3, n_inliers):
 
     inlier_score = min(n_inliers / 40.0, 1.0)
 
-    # Geometric mean: every signal must be reasonable.
+    wall_amount_score = min(max(wall_a_count, wall_b_count) / 28.0, 1.0)
+
+    # Geometric mean: every signal must be reasonable. The explicit conflict
+    # term keeps a map from passing just because a few outer walls overlap.
     conf = (max(wall_agreement, 0.0)
+            * max(wall_coverage, 0.0)
             * max(overlap_score, 0.0)
-            * max(inlier_score, 0.0)) ** (1.0 / 3.0)
+            * max(inlier_score, 0.0)
+            * max(conflict_score, 0.0)
+            * max(wall_amount_score, 0.0)) ** (1.0 / 6.0)
 
     return conf, {
         "overlap_cells": overlap_cells,
         "wall_union_cells": wall_union_count,
+        "wall_a_cells": wall_a_count,
+        "wall_b_cells": wall_b_count,
         "wall_agreement": wall_agreement,
+        "wall_coverage": wall_coverage,
         "overlap_ratio": overlap_ratio,
+        "conflict_cells": conflict_count,
+        "conflict_ratio": conflict_ratio,
         "inliers": n_inliers,
+        "known_a_cells": a_known_total,
+        "known_b_cells": b_known_total,
     }
+
+
+def alignment_quality_passes(confidence, diagnostics, threshold,
+                             trusted_prior=False):
+    """Return True only when a transform is good enough to publish."""
+    if trusted_prior:
+        # The image score may be low when the robots have explored adjacent
+        # but not overlapping regions. For a trusted coordinate prior, enough
+        # map content is the important guardrail.
+        return min(
+            diagnostics.get("known_a_cells", 0),
+            diagnostics.get("known_b_cells", 0),
+        ) >= MIN_CELLS_BEFORE_PRIOR_MERGE
+
+    if confidence < threshold:
+        return False
+    if diagnostics.get("wall_union_cells", 0) < MIN_WALL_UNION_FOR_ALIGNMENT:
+        return False
+    if diagnostics.get("wall_agreement", 0.0) < MIN_WALL_AGREEMENT_FOR_ALIGNMENT:
+        return False
+    if diagnostics.get("overlap_ratio", 0.0) < MIN_OVERLAP_RATIO_FOR_ALIGNMENT:
+        return False
+    if diagnostics.get("conflict_ratio", 1.0) > MAX_OCCUPANCY_CONFLICT_RATIO:
+        return False
+    return True
 
 
 # Public entry point
 
 def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
-               confidence_threshold=0.5):
+               confidence_threshold=0.5, prior_transforms=None,
+               prior_labels=None, trusted_prior_labels=None):
     """Top-level: align grid B to grid A and fuse them.
 
     Args:
@@ -482,6 +550,10 @@ def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
         merged_grid       : merged occupancy grid (or None on failure)
         diagnostics       : dict with intermediate counts for debugging, just like extra info 
     """
+    prior_transforms = prior_transforms or []
+    prior_labels = prior_labels or []
+    trusted_prior_labels = set(trusted_prior_labels or [])
+
     img_a = occupancy_to_gray(grid_a)
     img_b = occupancy_to_gray(grid_b)
 
@@ -509,6 +581,9 @@ def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
             "kp_b": len(kp_b) if kp_b else 0,
             "good_matches": len(matches),
             "inliers": 0,
+            "candidate_source": "none",
+            "raw_confidence": 0.0,
+            "trusted_prior": False,
         },
         # Kept around for visualization purposes:
         "_img_a": img_a,
@@ -520,13 +595,41 @@ def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
         "_upscale": upscale,
     }
 
-    if len(matches) < 4:
-        return result
+    scored_candidates = []
 
-    candidates = estimate_rigid_transform(kp_a, kp_b, matches, n_attempts=6)
+    def add_scored_candidate(M_grid, label, n_inliers=0, inlier_mask=None,
+                             trusted_prior=False):
+        if M_grid is None:
+            return
+        M_grid = np.asarray(M_grid, dtype=np.float32)
+        if M_grid.shape != (2, 3):
+            return
+        conf, info = alignment_confidence(grid_a, grid_b, M_grid, n_inliers)
+        effective_conf = (
+            max(conf, TRUSTED_PRIOR_EFFECTIVE_CONFIDENCE)
+            if trusted_prior else conf
+        )
+        info["candidate_source"] = label
+        info["raw_confidence"] = conf
+        info["trusted_prior"] = bool(trusted_prior)
+        rank_conf = effective_conf + (PRIOR_RANKING_BONUS if label.startswith("prior") else 0.0)
+        scored_candidates.append({
+            "M_grid": M_grid,
+            "inlier_mask": inlier_mask,
+            "n_inliers": n_inliers,
+            "confidence": effective_conf,
+            "rank_confidence": rank_conf,
+            "diagnostics": info,
+        })
 
-    if not candidates:
-        return result
+    for idx, M_prior in enumerate(prior_transforms):
+        label = prior_labels[idx] if idx < len(prior_labels) else f"prior_{idx}"
+        trusted = label in trusted_prior_labels
+        add_scored_candidate(M_prior, label, n_inliers=0, trusted_prior=trusted)
+
+    candidates = []
+    if len(matches) >= 4:
+        candidates = estimate_rigid_transform(kp_a, kp_b, matches, n_attempts=6)
 
     # Rank candidates by the structural-confidence metric, not by raw inlier
     # count. This is the key insight that gets us past spurious matches on
@@ -536,9 +639,6 @@ def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
     # of it, which handles the failure mode where ORB locks onto a transform
     # that aligns the outer walls of a near-symmetric environment but flips
     # the interior.
-    best_conf = -1.0
-    best = None
-    best_extra_rot_deg = 0.0
     for M_cand, inliers_cand, n_inliers_cand in candidates:
         if n_inliers_cand < MIN_INLIERS_FOR_ALIGNMENT:
             continue
@@ -554,18 +654,35 @@ def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
         if variant is None:
             continue
         M_best_var, c, info, extra_deg = variant
-        if c > best_conf:
-            best_conf = c
-            best = (M_cand, inliers_cand, n_inliers_cand, M_best_var, info)
-            best_extra_rot_deg = extra_deg
+        info["candidate_source"] = "feature_ransac"
+        info["raw_confidence"] = c
+        info["trusted_prior"] = False
+        info["disambig_rotation_deg"] = extra_deg
+        scored_candidates.append({
+            "M_grid": M_best_var,
+            "inlier_mask": inliers_cand,
+            "n_inliers": n_inliers_cand,
+            "confidence": c,
+            "rank_confidence": c,
+            "diagnostics": info,
+        })
 
-    if best is None:
+    result["diagnostics"]["n_candidates"] = len(candidates)
+    result["diagnostics"]["n_scored_candidates"] = len(scored_candidates)
+
+    if not scored_candidates:
         return result
 
-    M_upscaled, inlier_mask, n_inliers, M, score_info = best
+    best = max(scored_candidates, key=lambda item: item["rank_confidence"])
+    M = best["M_grid"]
+    inlier_mask = best["inlier_mask"]
+    n_inliers = best["n_inliers"]
+    score_info = best["diagnostics"]
+    best_conf = best["confidence"]
+    trusted_prior = bool(score_info.get("trusted_prior", False))
+
     result["diagnostics"]["inliers"] = n_inliers
-    result["diagnostics"]["n_candidates"] = len(candidates)
-    result["diagnostics"]["disambig_rotation_deg"] = best_extra_rot_deg
+    result["diagnostics"]["disambig_rotation_deg"] = score_info.get("disambig_rotation_deg", 0.0)
     result["_inlier_mask"] = inlier_mask
     result["confidence"] = best_conf
     result["diagnostics"].update(score_info)
@@ -579,7 +696,10 @@ def merge_maps(grid_a, grid_b, resolution_m_per_cell=None,
         ty_m = float(M[1, 2]) * resolution_m_per_cell
         result["transform_meters"] = {"tx": tx_m, "ty": ty_m, "theta": theta}
 
-    if confidence < confidence_threshold:
+    if not alignment_quality_passes(
+        confidence, result["diagnostics"], confidence_threshold,
+        trusted_prior=trusted_prior,
+    ):
         return result
 
     result["merged_grid"] = fuse_grids(grid_a, grid_b, M)
