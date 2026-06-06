@@ -41,19 +41,6 @@ The intended behavior is:
 8. /mission_complete stops robot motion and the finalizer writes report evidence.
 ```
 
-For tomorrow, the fastest code-reading path is:
-
-```text
-vnc-ros/ros2_ws/src/final_project_cv/launch/integrated_two_robot_demo.launch.py
-vnc-ros/ros2_ws/src/final_project_cv/worlds/lightweight_targets.world
-vnc-ros/ros2_ws/src/final_project_cv/final_project_cv/vision_target_detector_node.py
-vnc-ros/ros2_ws/src/final_project_cv/final_project_cv/target_localizer_node.py
-vnc-ros/ros2_ws/src/mapper/mapper.py
-vnc-ros/ros2_ws/src/mapper/coordinator.py
-vnc-ros/ros2_ws/src/merger/merger/map_coordinator.py
-vnc-ros/ros2_ws/src/final_project_cv/tools/generate_report_visuals.py
-```
-
 ## Topic Convention
 
 Coordination topics use the flat `<name>_<id>` convention:
